@@ -1,40 +1,5 @@
-# Lightweight IDS for Small Networks and IoT Devices
-
-A simple, fast intrusion detection system for small networks and IoT environments.
-
-## Quick Start
-
-```bash
-pip install -r requirements.txt
-python simple_ids.py --interface eth0
-```
-
-## Usage
-
-```bash
-# Live capture
-python simple_ids.py --interface eth0
-
-# PCAP analysis  
-python simple_ids.py --pcap traffic.pcap
-
-# List interfaces
-python simple_ids.py --list-interfaces
-```
-
-## Features
-
-- Port scan detection
-- SYN/ICMP flood detection
-- Data exfiltration monitoring
-- Suspicious port access
-- IP whitelisting
-- Real-time alerts
-
-## Configuration
-
-Edit `config.yaml` to adjust detection thresholds and settings.
-
-## License
-
-MIT License
+The increasing reliance on small-scale computer networks in homes, small businesses and edge environments has introduced significant cybersecurity risks due to limited monitoring capabilities and lack of dedicated security infrastructure. Unlike enterprise networks, small networks often operate without intrusion detection mechanisms, making them vulnerable to cyber threats such as unauthorized access, network scanning, denial-of-service attacks and abnormal traffic behavior.
+This project proposes the design and implementation of a lightweight, AI-assisted Intrusion Detection System (IDS) specifically tailored for small network environments. The system adopts an anomaly-based detection approach that models normal network behavior and identifies deviations indicative of potential security threats, rather than relying on predefined attack signatures.
+Network traffic is captured at a gateway device, transformed into lightweight statistical flow-based features and analyzed using an efficient machine learning model (Isolation Forest) optimized for low computational overhead. The system operates locally, enabling real-time detection without reliance on cloud infrastructure.
+The proposed IDS is evaluated based on detection accuracy, false positive rate, resource utilization and responsiveness to simulated attacks. The expected outcome demonstrates that effective intrusion detection can be achieved in small networks using lightweight machine learning techniques and minimal hardware resources.
+This work contributes toward practical and deployable cybersecurity solutions for environments where traditional IDS solutions are impractical.
