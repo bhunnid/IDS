@@ -175,11 +175,11 @@ class Detector:
         cutoff_time = current_time - window
         self.syn_flood_times[src_ip] = [t for t in self.syn_flood_times[src_ip] if t > cutoff_time]
         
-        # Check threshold
-        syn_rate = len(self.syn_flood_times[src_ip]) / window
-        if syn_rate >= threshold:
+        # Check threshold - count SYN packets in window
+        syn_count_in_window = len(self.syn_flood_times[src_ip])
+        if syn_count_in_window >= threshold:
             return Alert("SYN Flood Detected", src_ip, CRITICAL, {
-                "syn_rate": f"{syn_rate:.1f} packets/sec",
+                "syn_packets": syn_count_in_window,
                 "time_window": f"{window}s"
             })
         
@@ -199,11 +199,11 @@ class Detector:
         cutoff_time = current_time - window
         self.icmp_flood_times[src_ip] = [t for t in self.icmp_flood_times[src_ip] if t > cutoff_time]
         
-        # Check threshold
-        icmp_rate = len(self.icmp_flood_times[src_ip]) / window
-        if icmp_rate >= threshold:
+        # Check threshold - count ICMP packets in window
+        icmp_count_in_window = len(self.icmp_flood_times[src_ip])
+        if icmp_count_in_window >= threshold:
             return Alert("ICMP Flood Detected", src_ip, CRITICAL, {
-                "icmp_rate": f"{icmp_rate:.1f} packets/sec",
+                "icmp_packets": icmp_count_in_window,
                 "time_window": f"{window}s"
             })
         

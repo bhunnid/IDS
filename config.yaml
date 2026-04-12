@@ -11,19 +11,19 @@ whitelist:
 # Detection Thresholds
 thresholds:
   # Port Scan Detection
-  port_scan_ports: 3           # Unique ports from one IP in time window
+  port_scan_ports: 15          # Unique ports from one IP in time window
   port_scan_window: 10         # Time window in seconds
   
   # SYN Flood Detection  
-  syn_flood_threshold: 5       # SYN packets per second
+  syn_flood_threshold: 80      # SYN packets per second
   syn_flood_window: 5          # Time window in seconds
   
   # ICMP Flood Detection
-  icmp_threshold: 3            # ICMP packets per second
+  icmp_threshold: 40           # ICMP packets per second
   icmp_window: 5               # Time window in seconds
   
   # Data Exfiltration
-  data_exfiltration_bytes: 10000     # 10KB per flow
+  data_exfiltration_bytes: 1000000    # 1MB per flow
   
   # Suspicious Ports
   suspicious_ports: [23, 8080, 4444, 5555, 1337, 31337]
