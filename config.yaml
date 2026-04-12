@@ -1,0 +1,58 @@
+# ============================================================
+# Lightweight IDS Configuration
+# Production-ready thresholds for real-world intrusion detection
+# ============================================================
+
+# IP Whitelist (skip detection for these IPs)
+whitelist:
+  - "192.168.1.1"
+  - "192.168.1.254"
+
+# Detection Thresholds
+thresholds:
+  # Port Scan Detection
+  port_scan_ports: 3           # Unique ports from one IP in time window
+  port_scan_window: 10         # Time window in seconds
+  
+  # SYN Flood Detection  
+  syn_flood_threshold: 5       # SYN packets per second
+  syn_flood_window: 5          # Time window in seconds
+  
+  # ICMP Flood Detection
+  icmp_threshold: 3            # ICMP packets per second
+  icmp_window: 5               # Time window in seconds
+  
+  # Data Exfiltration
+  data_exfiltration_bytes: 10000     # 10KB per flow
+  
+  # Suspicious Ports
+  suspicious_ports: [23, 8080, 4444, 5555, 1337, 31337]
+  
+  # Connection Limits
+  max_connections_per_second: 50
+  max_flows_per_ip: 100
+
+# Flow Configuration
+flow:
+  timeout: 60                  # Flow timeout in seconds
+  max_flows: 5000              # Maximum concurrent flows (memory control)
+
+# Capture Configuration
+capture:
+  interface: "eth0"            # Network interface for live capture
+  promiscuous: true            # Enable promiscuous mode
+  
+# Output Configuration
+output:
+  alerts_file: "results/alerts.log"
+  console_output: true
+  max_alerts_per_minute: 100   # Rate limit alerts
+
+# Alert Configuration
+alerting:
+  cooldown_seconds: 10          # Alert cooldown to prevent spam
+
+# Performance
+performance:
+  memory_limit_mb: 512         # Maximum memory usage
+  cleanup_interval: 30         # Cleanup interval in seconds

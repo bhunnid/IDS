@@ -1,0 +1,3 @@
+# Lightweight IDS Requirements
+scapy>=2.5.0
+PyYAML>=6.0
