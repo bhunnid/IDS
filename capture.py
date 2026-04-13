@@ -11,7 +11,15 @@ from scapy.all import ICMP, IP, TCP, UDP, get_if_list, sniff
 
 from pipeline import PACKET_QUEUE
 
-PACKET_FIELDNAMES = ["timestamp", "src_ip", "dst_ip", "size", "protocol"]
+PACKET_FIELDNAMES = [
+    "timestamp",
+    "src_ip",
+    "dst_ip",
+    "src_port",
+    "dst_port",
+    "size",
+    "protocol",
+]
 
 
 def list_interfaces() -> list[str]:
@@ -35,10 +43,21 @@ def parse_packet(packet) -> dict[str, object] | None:
         return None
 
     ip_layer = packet[IP]
+    src_port = None
+    dst_port = None
+    if packet.haslayer(TCP):
+        src_port = int(packet[TCP].sport)
+        dst_port = int(packet[TCP].dport)
+    elif packet.haslayer(UDP):
+        src_port = int(packet[UDP].sport)
+        dst_port = int(packet[UDP].dport)
+
     return {
         "timestamp": float(packet.time),
         "src_ip": str(ip_layer.src),
         "dst_ip": str(ip_layer.dst),
+        "src_port": src_port,
+        "dst_port": dst_port,
         "size": int(len(packet)),
         "protocol": _protocol_name(packet),
     }

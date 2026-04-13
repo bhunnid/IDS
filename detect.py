@@ -106,6 +106,7 @@ def run_live(
     iface: str | None = None,
     window_size: int = WINDOW_SECONDS,
     log_path: str = DEFAULT_LOG_PATH,
+    local_ips: list[str] | None = None,
 ) -> None:
     """Start live capture in a background thread and classify windows forever."""
     capture_thread = threading.Thread(
@@ -122,7 +123,7 @@ def run_live(
     )
     psutil.cpu_percent(interval=None)
 
-    for feature_row in live_windows(window_size=window_size):
+    for feature_row in live_windows(window_size=window_size, local_ips=local_ips):
         label, score = predict(model, scaler, feature_row, threshold)
         print_window(feature_row, score, label)
         if label == "ALERT":
@@ -167,6 +168,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--window", type=int, default=WINDOW_SECONDS, help="Live window size in seconds")
     parser.add_argument("--replay", help="Optional features CSV for replay mode")
     parser.add_argument("--log", default=DEFAULT_LOG_PATH, help="Alert log file path")
+    parser.add_argument(
+        "--local-ip",
+        action="append",
+        default=[],
+        help="Local IP to use for inbound/outbound live features; repeat for multiple IPs",
+    )
     return parser
 
 
@@ -185,6 +192,7 @@ if __name__ == "__main__":
                 iface=args.iface,
                 window_size=args.window,
                 log_path=args.log,
+                local_ips=args.local_ip,
             )
     except KeyboardInterrupt:
         print("\n[detect] Detection stopped.")
