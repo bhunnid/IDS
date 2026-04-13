@@ -1,1 +1,1 @@
-A real-time, flow-based, anomaly detection IDS using unsupervised machine learning deployed at the network edge with resource-aware design
+An IDS for small scale networks.

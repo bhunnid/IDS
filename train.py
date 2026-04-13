@@ -1,30 +1,42 @@
 """
-train.py — Train an Isolation Forest model on NORMAL traffic only.
-Saves both the trained model and a fitted StandardScaler to disk.
+train.py — Train an Isolation Forest on NORMAL traffic.
+
+Responsibilities:
+  - Load a feature CSV produced by features.py
+  - Fit a StandardScaler (removes feature-scale bias)
+  - Fit an Isolation Forest on the scaled features
+  - Save both artefacts to disk
+
+Architecture notes:
+  - No imports from any other IDS module — fully standalone
+  - FEATURE_COLS is imported from features.py so column order is
+    defined in exactly one place
 
 Why scale features?
-    Features like total_bytes (thousands) and icmp_count (single digits)
-    live on very different scales. Without scaling, Isolation Forest
-    implicitly weights high-magnitude features more heavily, which can
-    cause it to miss anomalies in low-magnitude dimensions entirely.
-    StandardScaler brings every feature to mean=0, std=1 before training.
+  Raw features span very different magnitudes:
+    total_bytes   → hundreds of thousands
+    icmp_count    → single digits
+  Without scaling, Isolation Forest trees split almost exclusively on
+  total_bytes and effectively ignore icmp_count.  StandardScaler maps
+  every feature to mean=0, std=1 before training so each feature has
+  equal influence on the tree splits.
 
-How Isolation Forest works (simple explanation):
-    - Randomly partitions the feature space using decision trees.
-    - Anomalies are isolated (split off) quickly because they're sparse
-      or unusual — short path length through the trees = anomaly.
-    - Score < 0 → anomaly. Score > 0 → normal.
-
-Contamination guide (tune this for your report):
-    0.01 → very strict — few false positives, may miss subtle attacks
-    0.05 → balanced default — good starting point
-    0.10 → permissive  — catches more, but noisier
+Contamination guide (--contamination flag):
+  0.01 → very strict: few false positives, may miss subtle attacks
+  0.05 → balanced default
+  0.10 → permissive: higher recall, noisier in clean traffic
 
 Usage:
-    python capture.py --save normal_traffic.csv
-    python features.py --input normal_traffic.csv --output normal_features.csv
-    python train.py --input normal_features.csv --model ids_model.pkl
-    → Also saves scaler.pkl alongside the model automatically.
+    # 1. Capture normal traffic
+    python capture.py --save normal.csv
+
+    # 2. Extract features
+    python features.py --input normal.csv --output normal_features.csv
+
+    # 3. Train
+    python train.py --input normal_features.csv
+    python train.py --input normal_features.csv --contamination 0.01
+    python train.py --input normal_features.csv --model my_model.pkl --scaler my_scaler.pkl
 """
 
 import argparse
@@ -35,95 +47,114 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
-# Columns used as model inputs — must match what features.py produces
-FEATURE_COLS = [
-    "packet_count",
-    "avg_pkt_size",
-    "total_bytes",
-    "unique_ips",
-    "tcp_count",
-    "udp_count",
-    "icmp_count",
-    "other_count",
-]
+# Import ONLY the column list — no circular risk
+from features import FEATURE_COLS
 
-# Default scaler output path — detect.py loads this automatically
-SCALER_PATH = "scaler.pkl"
-
-# Contamination: estimated fraction of anomalies in training data.
-CONTAMINATION = 0.05
+# ── Defaults ──────────────────────────────────────────────────────────────────
+DEFAULT_MODEL_PATH  = "ids_model.pkl"
+DEFAULT_SCALER_PATH = "scaler.pkl"
+DEFAULT_CONTAMINATION = 0.05
 
 
-def train(features_csv: str, model_path: str,
-          contamination: float = CONTAMINATION,
-          scaler_path: str = SCALER_PATH):
-    """Load feature CSV, scale features, fit Isolation Forest, save both artifacts."""
+# ── Training ──────────────────────────────────────────────────────────────────
+
+def train(
+    features_csv:  str,
+    model_path:    str   = DEFAULT_MODEL_PATH,
+    scaler_path:   str   = DEFAULT_SCALER_PATH,
+    contamination: float = DEFAULT_CONTAMINATION,
+) -> None:
+    """
+    Load features, fit scaler + model, save both to disk.
+
+    Prints a training report including:
+      - per-feature raw statistics (for report)
+      - anomaly score range on training data
+      - number of training windows flagged
+    """
+    # ── Load data ─────────────────────────────────────────────────────────────
     df = pd.read_csv(features_csv)
-
     missing = [c for c in FEATURE_COLS if c not in df.columns]
     if missing:
-        raise ValueError(f"Missing columns in input CSV: {missing}")
+        raise ValueError(
+            f"Feature CSV is missing columns: {missing}\n"
+            f"Expected: {FEATURE_COLS}\n"
+            f"Got:      {list(df.columns)}"
+        )
 
-    X = df[FEATURE_COLS].values
-    print(f"[train] Loaded {len(X)} feature windows from {features_csv}")
-    print(f"[train] Contamination rate: {contamination}\n")
+    X = df[FEATURE_COLS].to_numpy(dtype=float)
+    print(f"[train] {len(X)} windows loaded from {features_csv}")
+    print(f"[train] contamination = {contamination}\n")
 
-    # ── Feature scaling ────────────────────────────────────────────────────────
-    # Fit scaler on training data only; detect.py applies the same transform
-    # at inference time so the model always sees the same feature distribution.
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    # Show what scaling did — useful for your report
-    print("[train] Feature statistics after scaling (mean≈0, std≈1):")
+    # ── Feature statistics (useful in report) ─────────────────────────────────
+    print("[train] Raw feature statistics:")
+    header = f"  {'feature':<16}  {'mean':>12}  {'std':>12}  {'min':>10}  {'max':>10}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
     for i, col in enumerate(FEATURE_COLS):
-        raw_mean = X[:, i].mean()
-        raw_std  = X[:, i].std()
-        print(f"         {col:<16s}  raw mean={raw_mean:>10.2f}  raw std={raw_std:>10.2f}")
+        col_data = X[:, i]
+        print(
+            f"  {col:<16}  {col_data.mean():>12.2f}  {col_data.std():>12.2f}"
+            f"  {col_data.min():>10.2f}  {col_data.max():>10.2f}"
+        )
 
-    # ── Model training ─────────────────────────────────────────────────────────
-    print(f"\n[train] Training Isolation Forest (n_estimators=100, contamination={contamination})...")
+    # ── Fit scaler ────────────────────────────────────────────────────────────
+    scaler   = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    print(f"\n[train] StandardScaler fitted — features scaled to mean≈0, std≈1")
+
+    # ── Fit model ─────────────────────────────────────────────────────────────
+    print(f"[train] Training IsolationForest (n_estimators=100) ...")
     model = IsolationForest(
         n_estimators=100,
         contamination=contamination,
-        random_state=42,    # reproducible — same seed = same model every run
-        n_jobs=-1,          # use all CPU cores
+        random_state=42,   # reproducible; same seed → same model every run
+        n_jobs=-1,         # use all CPU cores during training only
     )
     model.fit(X_scaled)
-    print("[train] Training complete.")
 
-    # ── Sanity check on training data ─────────────────────────────────────────
+    # ── Training report ───────────────────────────────────────────────────────
     scores      = model.decision_function(X_scaled)
     predictions = model.predict(X_scaled)          # 1=normal, -1=anomaly
-    n_anomalies = (predictions == -1).sum()
+    n_anomalies = int((predictions == -1).sum())
+    pct         = n_anomalies / len(X) * 100
 
-    print(f"\n[train] Anomaly score range: [{scores.min():.4f}, {scores.max():.4f}]")
-    print(f"[train] Decision boundary  : 0.0  (below = anomaly)")
-    print(f"[train] Windows flagged    : {n_anomalies}/{len(X)} "
-          f"({n_anomalies / len(X) * 100:.1f}%)")
+    print(f"\n[train] Score range on training data: [{scores.min():.4f}, {scores.max():.4f}]")
+    print(f"[train] Decision boundary: 0.0  (scores below threshold → ALERT)")
+    print(f"[train] Flagged in training: {n_anomalies}/{len(X)} ({pct:.1f}%)")
 
-    if n_anomalies / len(X) > 0.15:
-        print("[train] WARNING: >15% of training windows flagged — consider "
-              "lowering --contamination or capturing cleaner baseline traffic.")
+    if pct > 15:
+        print(
+            "[train] WARNING: >15% of training windows flagged.\n"
+            "         Consider capturing more normal traffic or lowering --contamination."
+        )
 
-    # ── Persist artifacts ─────────────────────────────────────────────────────
+    # ── Save artefacts ────────────────────────────────────────────────────────
     joblib.dump(model,  model_path)
     joblib.dump(scaler, scaler_path)
     print(f"\n[train] Model  saved → {model_path}")
     print(f"[train] Scaler saved → {scaler_path}")
+    print("[train] Done.")
 
 
-# ── CLI entry point ──────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train IDS anomaly detection model")
-    parser.add_argument("--input",         required=True,       metavar="CSV",
-                        help="Features CSV from features.py")
-    parser.add_argument("--model",         default="ids_model.pkl", metavar="PKL",
-                        help="Output model file (default: ids_model.pkl)")
-    parser.add_argument("--scaler",        default=SCALER_PATH, metavar="PKL",
-                        help=f"Output scaler file (default: {SCALER_PATH})")
-    parser.add_argument("--contamination", type=float, default=CONTAMINATION,
-                        help=f"Fraction of anomalies in training data (default: {CONTAMINATION})")
+    parser = argparse.ArgumentParser(description="Train IDS Isolation Forest model")
+    parser.add_argument("--input",         required=True,
+                        metavar="CSV",     help="Features CSV from features.py")
+    parser.add_argument("--model",         default=DEFAULT_MODEL_PATH,
+                        metavar="PKL",     help=f"Model output path (default: {DEFAULT_MODEL_PATH})")
+    parser.add_argument("--scaler",        default=DEFAULT_SCALER_PATH,
+                        metavar="PKL",     help=f"Scaler output path (default: {DEFAULT_SCALER_PATH})")
+    parser.add_argument("--contamination", default=DEFAULT_CONTAMINATION, type=float,
+                        metavar="FLOAT",   help=f"Fraction of anomalies in training data "
+                                                f"(default: {DEFAULT_CONTAMINATION})")
     args = parser.parse_args()
 
-    train(args.input, args.model, args.contamination, args.scaler)
+    train(
+        features_csv  = args.input,
+        model_path    = args.model,
+        scaler_path   = args.scaler,
+        contamination = args.contamination,
+    )
