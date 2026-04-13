@@ -82,6 +82,38 @@ def cmd_evaluate(args) -> None:
     print(metrics_frame.to_string(index=False))
 
 
+def cmd_label_dataset(args) -> None:
+    from dataset import label_features
+
+    frame = label_features(
+        input_csv=args.input,
+        output_csv=args.output,
+        label=args.label,
+        scenario=args.scenario,
+        label_column=args.label_column,
+        scenario_column=args.scenario_column,
+    )
+    print(f"[run_ids] Labeled {len(frame)} rows -> {args.output}")
+
+
+def cmd_merge_datasets(args) -> None:
+    from dataset import merge_datasets
+
+    frame = merge_datasets(
+        inputs=args.inputs,
+        output_csv=args.output,
+        deduplicate=args.deduplicate,
+    )
+    print(f"[run_ids] Merged {len(frame)} rows -> {args.output}")
+
+
+def cmd_dataset_summary(args) -> None:
+    from dataset import dataset_summary
+
+    summary = dataset_summary(args.input)
+    print(summary)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="run_ids.py",
@@ -154,6 +186,25 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument("--metrics-out", help="Optional metrics CSV output path")
     evaluate_parser.add_argument("--scored-out", help="Optional per-row score CSV output path")
     evaluate_parser.set_defaults(func=cmd_evaluate)
+
+    label_parser = subparsers.add_parser("label", help="Label a feature CSV for evaluation")
+    label_parser.add_argument("--input", required=True, help="Feature CSV to label")
+    label_parser.add_argument("--output", required=True, help="Output labeled CSV")
+    label_parser.add_argument("--label", required=True, help="Ground-truth label, for example normal or attack")
+    label_parser.add_argument("--scenario", required=True, help="Scenario tag, for example nmap_scan")
+    label_parser.add_argument("--label-column", default="label", help="Label column name")
+    label_parser.add_argument("--scenario-column", default="scenario", help="Scenario column name")
+    label_parser.set_defaults(func=cmd_label_dataset)
+
+    merge_parser = subparsers.add_parser("merge", help="Merge labeled feature CSVs")
+    merge_parser.add_argument("--inputs", nargs="+", required=True, help="Input labeled CSV files")
+    merge_parser.add_argument("--output", required=True, help="Merged dataset output path")
+    merge_parser.add_argument("--deduplicate", action="store_true", help="Drop duplicate rows after merge")
+    merge_parser.set_defaults(func=cmd_merge_datasets)
+
+    summary_parser = subparsers.add_parser("summary", help="Summarize a labeled dataset")
+    summary_parser.add_argument("--input", required=True, help="Merged labeled dataset CSV")
+    summary_parser.set_defaults(func=cmd_dataset_summary)
 
     return parser
 

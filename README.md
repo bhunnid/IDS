@@ -9,6 +9,7 @@ A lightweight, modular, anomaly-based intrusion detection system for Windows 11.
 - `features.py`: converts packets into fixed time-window features for training and live detection.
 - `train.py`: trains `StandardScaler` plus `IsolationForest` and saves `ids_model.pkl` and `scaler.pkl`.
 - `detect.py`: runs live detection or replay detection and logs anomalies to `alerts.log`.
+- `dataset.py`: labels scenario captures, merges labeled runs, and summarizes datasets.
 - `evaluate.py`: computes formal metrics from labeled feature datasets, including threshold sweeps.
 - `run_ids.py`: single CLI entry point for the full workflow.
 
@@ -66,6 +67,24 @@ Replay feature windows:
 
 ```bash
 python run_ids.py replay --input normal_features.csv --threshold -0.10
+```
+
+Label a scenario capture:
+
+```bash
+python run_ids.py label --input nmap_features.csv --output nmap_labeled.csv --label attack --scenario nmap_scan
+```
+
+Merge multiple labeled scenarios:
+
+```bash
+python run_ids.py merge --inputs benign_labeled.csv nmap_labeled.csv syn_labeled.csv icmp_labeled.csv --output evaluation_dataset.csv
+```
+
+Summarize the merged dataset:
+
+```bash
+python run_ids.py summary --input evaluation_dataset.csv
 ```
 
 Evaluate labeled feature data:
@@ -139,10 +158,47 @@ Alert log format:
 
 1. Capture normal traffic and extract training features.
 2. Train the model on benign windows only.
-3. Capture or prepare labeled benign and attack windows.
-4. Run `evaluate` with multiple thresholds.
-5. Report precision, recall, F1, false positive rate, and ROC AUC.
-6. Compare thresholds and discuss tradeoffs.
+3. Capture each test scenario separately and convert each packet CSV into features.
+4. Label each scenario with `run_ids.py label`.
+5. Merge all labeled scenario files with `run_ids.py merge`.
+6. Run `run_ids.py summary` to confirm class balance and scenario counts.
+7. Run `evaluate` with multiple thresholds.
+8. Report precision, recall, F1, false positive rate, and ROC AUC.
+9. Compare thresholds and discuss tradeoffs.
+
+## Example Evaluation Workflow
+
+Train on benign traffic only:
+
+```bash
+python run_ids.py capture --iface "\Device\NPF_Loopback" --save train_normal.csv
+python run_ids.py features --input train_normal.csv --output train_normal_features.csv --window 10 --local-ip 127.0.0.1
+python run_ids.py train --input train_normal_features.csv --model ids_model.pkl --scaler scaler.pkl --contamination 0.05
+```
+
+Prepare labeled test scenarios:
+
+```bash
+python run_ids.py features --input benign_test.csv --output benign_test_features.csv --window 10 --local-ip 127.0.0.1
+python run_ids.py label --input benign_test_features.csv --output benign_labeled.csv --label normal --scenario benign
+
+python run_ids.py features --input nmap.csv --output nmap_features.csv --window 10 --local-ip 127.0.0.1
+python run_ids.py label --input nmap_features.csv --output nmap_labeled.csv --label attack --scenario nmap_scan
+
+python run_ids.py features --input syn_flood.csv --output syn_flood_features.csv --window 10 --local-ip 127.0.0.1
+python run_ids.py label --input syn_flood_features.csv --output syn_labeled.csv --label attack --scenario syn_flood
+
+python run_ids.py features --input icmp_flood.csv --output icmp_flood_features.csv --window 10 --local-ip 127.0.0.1
+python run_ids.py label --input icmp_flood_features.csv --output icmp_labeled.csv --label attack --scenario icmp_flood
+```
+
+Merge and evaluate:
+
+```bash
+python run_ids.py merge --inputs benign_labeled.csv nmap_labeled.csv syn_labeled.csv icmp_labeled.csv --output evaluation_dataset.csv
+python run_ids.py summary --input evaluation_dataset.csv
+python run_ids.py evaluate --input evaluation_dataset.csv --model ids_model.pkl --scaler scaler.pkl --threshold -0.10 --sweep -0.20 -0.10 -0.05 0.00 --metrics-out metrics.csv --scored-out scored_windows.csv
+```
 
 ## Attack Scenarios To Test
 
