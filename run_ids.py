@@ -1,155 +1,117 @@
-"""
-run_ids.py — Single entry point for the full IDS pipeline.
+"""Single CLI entry point for the lightweight anomaly-based IDS."""
 
-Modes:
-  live     Start live packet capture + real-time detection (default)
-  train    Capture normal traffic to CSV, extract features, train model
-  replay   Replay a pre-recorded features CSV through the detector
-
-Quick start:
-  # Step 1 — capture normal traffic for training (Ctrl+C when done)
-  python run_ids.py train --save normal.csv
-
-  # Step 2 — train the model
-  python run_ids.py train --features normal_features.csv
-
-  # Step 3 — start live detection
-  python run_ids.py live
-
-Full usage:
-  python run_ids.py live    [--model PKL] [--scaler PKL] [--iface NAME] [--threshold FLOAT]
-  python run_ids.py replay  --features CSV [--model PKL] [--scaler PKL] [--threshold FLOAT]
-  python run_ids.py capture --save CSV [--iface NAME]
-  python run_ids.py train   --input CSV [--model PKL] [--scaler PKL] [--contamination FLOAT]
-"""
+from __future__ import annotations
 
 import argparse
-import sys
 
 
-def cmd_capture(args):
-    """Capture live packets to a CSV file (for training data collection)."""
-    from capture import start_capture
-    print("[run_ids] Capturing packets — press Ctrl+C when you have enough normal traffic.\n")
-    try:
-        start_capture(iface=args.iface, save_path=args.save, verbose=args.verbose)
-    except KeyboardInterrupt:
-        print("\n[run_ids] Capture stopped.")
+def cmd_capture(args) -> None:
+    from capture import list_interfaces, start_capture
+
+    if args.list_ifaces:
+        for name in list_interfaces():
+            print(name)
+        return
+
+    start_capture(iface=args.iface, save_path=args.save, verbose=args.verbose)
 
 
-def cmd_features(args):
-    """Extract feature windows from a packet CSV."""
+def cmd_features(args) -> None:
     from features import windowed_features_from_csv
-    print(f"[run_ids] Extracting features from {args.input} → {args.output}")
-    df = windowed_features_from_csv(args.input, window_sec=args.window)
-    df.to_csv(args.output, index=False)
-    print(f"[run_ids] {len(df)} windows saved to {args.output}")
+
+    frame = windowed_features_from_csv(args.input, window_size=args.window)
+    frame.to_csv(args.output, index=False)
+    print(f"[run_ids] Wrote {len(frame)} windows to {args.output}")
 
 
-def cmd_train(args):
-    """Train the Isolation Forest on a features CSV."""
+def cmd_train(args) -> None:
     from train import train
+
     train(
-        features_csv  = args.input,
-        model_path    = args.model,
-        scaler_path   = args.scaler,
-        contamination = args.contamination,
+        features_csv=args.input,
+        model_path=args.model,
+        scaler_path=args.scaler,
+        contamination=args.contamination,
     )
 
 
-def cmd_live(args):
-    """Start live detection (capture + inference)."""
+def cmd_live(args) -> None:
     from detect import load_artifacts, run_live
+
     model, scaler = load_artifacts(args.model, args.scaler)
-    print("[run_ids] Starting live IDS — press Ctrl+C to stop.\n")
-    try:
-        run_live(model, scaler, threshold=args.threshold, iface=args.iface)
-    except KeyboardInterrupt:
-        print("\n[run_ids] Stopped cleanly.")
+    run_live(
+        model,
+        scaler,
+        threshold=args.threshold,
+        iface=args.iface,
+        window_size=args.window,
+        log_path=args.log,
+    )
 
 
-def cmd_replay(args):
-    """Replay a features CSV through the detector (offline testing)."""
+def cmd_replay(args) -> None:
     from detect import load_artifacts, run_replay
+
     model, scaler = load_artifacts(args.model, args.scaler)
-    run_replay(model, scaler, features_csv=args.features, threshold=args.threshold)
+    run_replay(
+        model,
+        scaler,
+        features_csv=args.input,
+        threshold=args.threshold,
+        log_path=args.log,
+    )
 
-
-# ── Argument parser ───────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="run_ids.py",
-        description="Lightweight Anomaly-Based IDS",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Lightweight anomaly-based IDS for Windows",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # ── capture ──────────────────────────────────────────────────────────────
-    p_cap = sub.add_parser("capture", help="Capture packets to CSV")
-    p_cap.add_argument("--save",    required=True,  metavar="CSV",
-                       help="Output CSV path")
-    p_cap.add_argument("--iface",   default=None,   metavar="NAME",
-                       help="Network interface name")
-    p_cap.add_argument("--verbose", action="store_true", default=True,
-                       help="Print each packet (default: on)")
+    capture_parser = subparsers.add_parser("capture", help="Capture packet metadata to CSV")
+    capture_parser.add_argument("--save", help="Optional packet CSV output path")
+    capture_parser.add_argument("--iface", help="Interface name such as 'Wi-Fi' or 'Ethernet'")
+    capture_parser.add_argument("--verbose", action="store_true", help="Print captured packets")
+    capture_parser.add_argument("--list-ifaces", action="store_true", help="List interfaces and exit")
+    capture_parser.set_defaults(func=cmd_capture)
 
-    # ── features ─────────────────────────────────────────────────────────────
-    p_feat = sub.add_parser("features", help="Extract features from packet CSV")
-    p_feat.add_argument("--input",  required=True, metavar="CSV",
-                        help="Packet CSV from 'capture'")
-    p_feat.add_argument("--output", required=True, metavar="CSV",
-                        help="Output features CSV")
-    p_feat.add_argument("--window", default=10,    type=int, metavar="SEC",
-                        help="Window size in seconds (default: 10)")
+    features_parser = subparsers.add_parser("features", help="Extract feature windows from packet CSV")
+    features_parser.add_argument("--input", required=True, help="Raw packet CSV from capture")
+    features_parser.add_argument("--output", required=True, help="Output feature CSV path")
+    features_parser.add_argument("--window", type=int, default=10, help="Window size in seconds")
+    features_parser.set_defaults(func=cmd_features)
 
-    # ── train ─────────────────────────────────────────────────────────────────
-    p_train = sub.add_parser("train", help="Train IsolationForest on features CSV")
-    p_train.add_argument("--input",         required=True,        metavar="CSV",
-                         help="Features CSV")
-    p_train.add_argument("--model",         default="ids_model.pkl", metavar="PKL",
-                         help="Output model path")
-    p_train.add_argument("--scaler",        default="scaler.pkl", metavar="PKL",
-                         help="Output scaler path")
-    p_train.add_argument("--contamination", default=0.05,         type=float,
-                         metavar="FLOAT",   help="Contamination rate (default: 0.05)")
+    train_parser = subparsers.add_parser("train", help="Train the anomaly detection model")
+    train_parser.add_argument("--input", required=True, help="Feature CSV from the features command")
+    train_parser.add_argument("--model", default="ids_model.pkl", help="Model output path")
+    train_parser.add_argument("--scaler", default="scaler.pkl", help="Scaler output path")
+    train_parser.add_argument("--contamination", type=float, default=0.05, help="IsolationForest contamination")
+    train_parser.set_defaults(func=cmd_train)
 
-    # ── live ──────────────────────────────────────────────────────────────────
-    p_live = sub.add_parser("live", help="Start live capture + detection")
-    p_live.add_argument("--model",     default="ids_model.pkl", metavar="PKL")
-    p_live.add_argument("--scaler",    default="scaler.pkl",    metavar="PKL")
-    p_live.add_argument("--iface",     default=None,            metavar="NAME")
-    p_live.add_argument("--threshold", default=-0.10,           type=float,
-                        metavar="FLOAT", help="Anomaly score threshold (default: -0.10)")
+    live_parser = subparsers.add_parser("live", help="Start live packet capture and anomaly detection")
+    live_parser.add_argument("--model", default="ids_model.pkl", help="Path to trained model")
+    live_parser.add_argument("--scaler", default="scaler.pkl", help="Path to trained scaler")
+    live_parser.add_argument("--iface", help="Interface name such as 'Wi-Fi' or 'Ethernet'")
+    live_parser.add_argument("--window", type=int, default=10, help="Window size in seconds")
+    live_parser.add_argument("--threshold", type=float, default=-0.10, help="Alert threshold")
+    live_parser.add_argument("--log", default="alerts.log", help="Alert log output path")
+    live_parser.set_defaults(func=cmd_live)
 
-    # ── replay ────────────────────────────────────────────────────────────────
-    p_replay = sub.add_parser("replay", help="Replay features CSV (offline test)")
-    p_replay.add_argument("--features",  required=True,           metavar="CSV")
-    p_replay.add_argument("--model",     default="ids_model.pkl", metavar="PKL")
-    p_replay.add_argument("--scaler",    default="scaler.pkl",    metavar="PKL")
-    p_replay.add_argument("--threshold", default=-0.10,           type=float,
-                          metavar="FLOAT")
+    replay_parser = subparsers.add_parser("replay", help="Replay feature CSV through the detector")
+    replay_parser.add_argument("--input", required=True, help="Feature CSV to replay")
+    replay_parser.add_argument("--model", default="ids_model.pkl", help="Path to trained model")
+    replay_parser.add_argument("--scaler", default="scaler.pkl", help="Path to trained scaler")
+    replay_parser.add_argument("--threshold", type=float, default=-0.10, help="Alert threshold")
+    replay_parser.add_argument("--log", default="alerts.log", help="Alert log output path")
+    replay_parser.set_defaults(func=cmd_replay)
 
     return parser
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
-    parser = build_parser()
-    args   = parser.parse_args()
-
-    dispatch = {
-        "capture":  cmd_capture,
-        "features": cmd_features,
-        "train":    cmd_train,
-        "live":     cmd_live,
-        "replay":   cmd_replay,
-    }
-
-    handler = dispatch.get(args.command)
-    if handler is None:
-        parser.print_help()
-        sys.exit(1)
-
-    handler(args)
+    args = build_parser().parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\n[run_ids] Stopped.")

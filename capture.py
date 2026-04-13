@@ -1,148 +1,138 @@
-"""
-capture.py — Live packet capture using Scapy.
+"""Packet capture utilities for the lightweight IDS."""
 
-Responsibilities:
-  - Sniff raw packets on a network interface
-  - Parse each packet into a lightweight dict
-  - Put the dict onto pipeline.PACKET_QUEUE
-  - Optionally write packets to a CSV file for offline training
-
-Architecture notes:
-  - Imports ONLY from pipeline (no circular risk)
-  - Uses sniff(prn=...) — no monkey-patching, no custom hooks
-  - The CSV writer is passed as a closure variable into _make_callback()
-    so it is never shared or mutated from outside this module
-  - start_capture() is blocking; run it in a daemon Thread from run_ids.py
-
-Usage (standalone — captures and prints raw packets):
-    python capture.py
-    python capture.py --save training_data.csv
-    python capture.py --save training_data.csv --iface "Wi-Fi"
-
-Requirements:
-    pip install scapy
-    On Windows: install Npcap from https://npcap.com and run as Administrator
-"""
+from __future__ import annotations
 
 import argparse
 import csv
-import time
+from pathlib import Path
+from typing import Callable
 
-from scapy.all import IP, ICMP, TCP, UDP, sniff
+from scapy.all import ICMP, IP, TCP, UDP, get_if_list, sniff
 
 from pipeline import PACKET_QUEUE
 
+PACKET_FIELDNAMES = ["timestamp", "src_ip", "dst_ip", "size", "protocol"]
 
-# ── Packet parsing ────────────────────────────────────────────────────────────
 
-def _protocol(pkt) -> str:
-    """Return a string label for the transport-layer protocol."""
-    if pkt.haslayer(TCP):
+def list_interfaces() -> list[str]:
+    """Return available capture interfaces in stable order."""
+    return sorted(dict.fromkeys(get_if_list()))
+
+
+def _protocol_name(packet) -> str:
+    if packet.haslayer(TCP):
         return "TCP"
-    if pkt.haslayer(UDP):
+    if packet.haslayer(UDP):
         return "UDP"
-    if pkt.haslayer(ICMP):
+    if packet.haslayer(ICMP):
         return "ICMP"
     return "OTHER"
 
 
-def parse_packet(pkt) -> dict | None:
-    """
-    Convert a raw Scapy packet to a plain dict.
-    Returns None if the packet has no IP layer (e.g. ARP, STP).
-    """
-    if not pkt.haslayer(IP):
+def parse_packet(packet) -> dict[str, object] | None:
+    """Convert a Scapy packet to a lightweight metadata record."""
+    if not packet.haslayer(IP):
         return None
+
+    ip_layer = packet[IP]
     return {
-        "timestamp": time.time(),
-        "src_ip":    pkt[IP].src,
-        "dst_ip":    pkt[IP].dst,
-        "size":      len(pkt),
-        "protocol":  _protocol(pkt),
+        "timestamp": float(packet.time),
+        "src_ip": str(ip_layer.src),
+        "dst_ip": str(ip_layer.dst),
+        "size": int(len(packet)),
+        "protocol": _protocol_name(packet),
     }
 
 
-# ── Callback factory ──────────────────────────────────────────────────────────
-
-def _make_callback(writer=None, verbose=False):
-    """
-    Return a prn= callback for sniff().
-
-    Using a factory instead of a module-level function means:
-      - writer is captured in the closure — no globals, no monkey-patching
-      - verbose flag is local to this call — no side effects on other modules
-
-    Args:
-        writer:  csv.DictWriter or None
-        verbose: if True, print each packet to console
-    """
-    def callback(pkt):
-        record = parse_packet(pkt)
+def _build_callback(
+    writer: csv.DictWriter | None = None,
+    csv_handle=None,
+    verbose: bool = False,
+) -> Callable:
+    def on_packet(packet) -> None:
+        record = parse_packet(packet)
         if record is None:
             return
+
         PACKET_QUEUE.put(record)
-        if writer:
+
+        if writer is not None:
             writer.writerow(record)
+            if csv_handle is not None:
+                csv_handle.flush()
+
         if verbose:
             print(
-                f"[{record['protocol']:5s}] "
-                f"{record['src_ip']:>15s} → {record['dst_ip']:<15s}  "
-                f"{record['size']} B"
+                f"[capture] {record['protocol']:<5} "
+                f"{record['src_ip']} -> {record['dst_ip']} "
+                f"{record['size']}B"
             )
-    return callback
+
+    return on_packet
 
 
-# ── Public entry point ────────────────────────────────────────────────────────
-
-def start_capture(iface=None, save_path=None, verbose=False):
-    """
-    Start live packet capture (blocking).
-
-    Call this from a daemon Thread — it runs until interrupted.
-
-    Args:
-        iface:     Interface name string, or None for Scapy's default.
-        save_path: Path to write a CSV of captured packets (training data).
-        verbose:   Print each captured packet to stdout.
-    """
-    csv_file = None
-    writer   = None
+def start_capture(
+    iface: str | None = None,
+    save_path: str | None = None,
+    verbose: bool = False,
+) -> None:
+    """Start a blocking Scapy sniff loop and push records into the queue."""
+    csv_handle = None
+    writer = None
 
     if save_path:
-        csv_file   = open(save_path, "w", newline="", encoding="utf-8")
-        fieldnames = ["timestamp", "src_ip", "dst_ip", "size", "protocol"]
-        writer     = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        output_path = Path(save_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_handle = output_path.open("w", newline="", encoding="utf-8")
+        writer = csv.DictWriter(csv_handle, fieldnames=PACKET_FIELDNAMES)
         writer.writeheader()
-        print(f"[capture] Saving to {save_path}")
+        csv_handle.flush()
+        print(f"[capture] Saving packet metadata to {output_path}")
 
-    callback = _make_callback(writer=writer, verbose=verbose)
+    if iface:
+        print(f"[capture] Sniffing on interface: {iface}")
+    else:
+        print("[capture] Sniffing on Scapy default interface")
 
-    print(f"[capture] Sniffing on {iface or 'default interface'} ...")
+    print("[capture] Windows requires Npcap and an elevated terminal.")
 
     try:
         sniff(
             iface=iface,
-            prn=callback,
-            store=False,   # do not accumulate packets in Scapy's memory
+            prn=_build_callback(writer=writer, csv_handle=csv_handle, verbose=verbose),
+            store=False,
         )
     finally:
-        # Guaranteed to run even if sniff() raises an exception
-        if csv_file:
-            csv_file.close()
-            print(f"[capture] Closed {save_path}")
+        if csv_handle is not None:
+            csv_handle.close()
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Capture packets for the IDS")
+    parser.add_argument("--iface", help="Capture interface name, for example 'Wi-Fi'")
+    parser.add_argument("--save", help="Optional CSV path for raw packet metadata")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print one line per captured packet",
+    )
+    parser.add_argument(
+        "--list-ifaces",
+        action="store_true",
+        help="List available capture interfaces and exit",
+    )
+    return parser
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="IDS packet capture")
-    parser.add_argument("--iface",   metavar="NAME", help="Interface name")
-    parser.add_argument("--save",    metavar="FILE", help="Save packets to CSV")
-    parser.add_argument("--verbose", action="store_true", default=True,
-                        help="Print each packet (default: on)")
-    args = parser.parse_args()
+    args = build_parser().parse_args()
+
+    if args.list_ifaces:
+        for name in list_interfaces():
+            print(name)
+        raise SystemExit(0)
 
     try:
         start_capture(iface=args.iface, save_path=args.save, verbose=args.verbose)
     except KeyboardInterrupt:
-        print("\n[capture] Stopped.")
+        print("\n[capture] Capture stopped.")

@@ -1,268 +1,190 @@
-"""
-detect.py — Real-time anomaly detection.
+"""Live and replay anomaly detection for the lightweight IDS."""
 
-Responsibilities:
-  - Load trained Isolation Forest + StandardScaler from disk
-  - Run live detection: start capture thread → read feature windows → classify
-  - Print colour-coded results per window with score, packet stats, resources
-  - Log every anomaly to alerts.log with timestamp, score, top source IPs
-  - Provide offline replay mode for testing against pre-recorded feature CSVs
-
-Architecture notes:
-  - NO imports from capture.py — avoids circular dependency entirely
-  - NO monkey-patching — capture.py's callback is self-contained
-  - IP tracking comes from features.py's live_windows() generator,
-    which returns "top_src_ips" in every feature dict (no shared mutable state)
-  - Thread model:
-      Thread-1 (daemon): start_capture() → puts packets on PACKET_QUEUE
-      Thread-2 (main):   live_windows() drains PACKET_QUEUE → ML → output
-
-Anomaly threshold guide:
-   0.0  → flag everything the model scores negative (broadest)
-  -0.05 → light buffer, reduces borderline false positives
-  -0.10 → recommended default
-  -0.20 → strict, only clear outliers
-
-Usage:
-    python detect.py --model ids_model.pkl --scaler scaler.pkl
-    python detect.py --replay features.csv --threshold -0.05
-    python detect.py --iface "Wi-Fi" --threshold -0.15
-"""
+from __future__ import annotations
 
 import argparse
-import sys
+import ast
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 import joblib
-import numpy as np
 import pandas as pd
 import psutil
 
-# Import the capture starter (NOT packet_queue — that comes from pipeline)
 from capture import start_capture
 from features import FEATURE_COLS, WINDOW_SECONDS, live_windows
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-LOG_FILE          = "alerts.log"
+DEFAULT_MODEL_PATH = "ids_model.pkl"
+DEFAULT_SCALER_PATH = "scaler.pkl"
 DEFAULT_THRESHOLD = -0.10
-
-# ANSI escape codes (work in Windows Terminal / PowerShell 7+)
-RED    = "\033[91m"
-GREEN  = "\033[92m"
-YELLOW = "\033[93m"
-CYAN   = "\033[96m"
-RESET  = "\033[0m"
+DEFAULT_LOG_PATH = "alerts.log"
 
 
-# ── Artefact loading ──────────────────────────────────────────────────────────
+def load_artifacts(model_path: str = DEFAULT_MODEL_PATH, scaler_path: str = DEFAULT_SCALER_PATH):
+    """Load the trained model and scaler from disk."""
+    model_file = Path(model_path)
+    scaler_file = Path(scaler_path)
+    if not model_file.exists():
+        raise FileNotFoundError(f"Model file not found: {model_file}")
+    if not scaler_file.exists():
+        raise FileNotFoundError(f"Scaler file not found: {scaler_file}")
 
-def load_artifacts(model_path: str, scaler_path: str):
-    """
-    Load and return (model, scaler).
-    Exits with a clear message if either file is missing.
-    """
-    result = {}
-    for name, path in [("model", model_path), ("scaler", scaler_path)]:
+    return joblib.load(model_file), joblib.load(scaler_file)
+
+
+def predict(model, scaler, feature_row: dict[str, object], threshold: float) -> tuple[str, float]:
+    """Return the window label and raw anomaly score."""
+    feature_values = pd.DataFrame(
+        [{column: float(feature_row[column]) for column in FEATURE_COLS}],
+        columns=FEATURE_COLS,
+    )
+    scaled_values = scaler.transform(feature_values)
+    score = float(model.decision_function(scaled_values)[0])
+    label = "ALERT" if score < threshold else "NORMAL"
+    return label, score
+
+
+def _format_top_sources(top_src_ips: list[tuple[str, int]] | object) -> str:
+    if not top_src_ips:
+        return "[]"
+    if isinstance(top_src_ips, str):
         try:
-            result[name] = joblib.load(path)
-            print(f"[detect] {name:<7} loaded ← {path}")
-        except FileNotFoundError:
-            print(f"[detect] ERROR: '{path}' not found.")
-            print("[detect] Run train.py first to generate model and scaler files.")
-            sys.exit(1)
-    return result["model"], result["scaler"]
+            parsed = ast.literal_eval(top_src_ips)
+            top_src_ips = parsed if isinstance(parsed, list) else []
+        except (ValueError, SyntaxError):
+            top_src_ips = []
+    parts = [f"{ip}({count})" for ip, count in list(top_src_ips)]
+    return "[" + ", ".join(parts) + "]"
 
 
-# ── Inference ─────────────────────────────────────────────────────────────────
-
-def predict(model, scaler, feat: dict, threshold: float) -> tuple[str, float]:
-    """
-    Scale the feature vector and run Isolation Forest inference.
-
-    Returns:
-        label : "NORMAL" or "ANOMALY"
-        score : raw decision_function score (higher = more normal)
-
-    The threshold is applied here so it can be tuned at runtime
-    without retraining the model.
-    """
-    X        = np.array([[feat[c] for c in FEATURE_COLS]], dtype=float)
-    X_scaled = scaler.transform(X)
-    score    = float(model.decision_function(X_scaled)[0])
-    label    = "ANOMALY" if score < threshold else "NORMAL"
-    return label, round(score, 4)
-
-
-# ── Resource measurement ──────────────────────────────────────────────────────
-
-def get_resources() -> tuple[float, float]:
-    """
-    Return (cpu_percent, memory_percent) for the current moment.
-    cpu_percent(interval=None) is non-blocking — it measures CPU usage
-    since the last call, adding negligible overhead per window.
-    """
-    return psutil.cpu_percent(interval=None), psutil.virtual_memory().percent
-
-
-# ── Alert logging ─────────────────────────────────────────────────────────────
-
-def log_alert(timestamp: str, score: float, feat: dict) -> None:
-    """
-    Append one anomaly event to alerts.log.
-
-    Format:
-        YYYY-MM-DD HH:MM:SS | ANOMALY | score=X | pkts=X | bytes=X | top_src=[ip(n), ...]
-    """
-    top_ips = feat.get("top_src_ips", [])
-    ip_str  = ", ".join(f"{ip}({n})" for ip, n in top_ips) if top_ips else "n/a"
+def log_alert(
+    feature_row: dict[str, object],
+    score: float,
+    log_path: str = DEFAULT_LOG_PATH,
+) -> None:
+    """Append an anomaly event to the alerts log."""
+    timestamp = datetime.fromtimestamp(float(feature_row["window_start"])).strftime("%Y-%m-%d %H:%M:%S")
     line = (
         f"{timestamp} | ANOMALY | score={score:+.4f} | "
-        f"pkts={feat.get('packet_count', 0)} | "
-        f"bytes={feat.get('total_bytes', 0)} | "
-        f"top_src=[{ip_str}]\n"
+        f"pkts={int(feature_row['packet_count'])} | "
+        f"bytes={int(feature_row['byte_count'])} | "
+        f"top_src_ips={_format_top_sources(feature_row.get('top_src_ips', []))}\n"
     )
-    with open(LOG_FILE, "a", encoding="utf-8") as fh:
-        fh.write(line)
+    with Path(log_path).open("a", encoding="utf-8") as handle:
+        handle.write(line)
 
 
-# ── Console output ────────────────────────────────────────────────────────────
+def print_window(feature_row: dict[str, object], score: float, label: str) -> None:
+    """Print one detection result line."""
+    timestamp = datetime.fromtimestamp(float(feature_row["window_start"])).strftime("%H:%M:%S")
+    cpu = psutil.cpu_percent(interval=None)
+    mem = psutil.virtual_memory().percent
+    packet_count = int(feature_row["packet_count"])
+    byte_count = int(feature_row["byte_count"])
 
-def print_window(feat: dict, label: str, score: float,
-                 cpu: float, mem: float) -> None:
-    """Print one detection window result to stdout."""
-    ts      = datetime.fromtimestamp(
-                  feat.get("window_start", time.time())
-              ).strftime("%H:%M:%S")
-    pkts    = feat.get("packet_count", 0)
-    total_b = feat.get("total_bytes",  0)
-    top_ips = feat.get("top_src_ips",  [])
-
-    if label == "ANOMALY":
-        status   = f"{RED}⚠  ALERT: ANOMALY DETECTED{RESET}"
-        ip_parts = [f"{YELLOW}{ip}{RESET}({n})" for ip, n in top_ips]
-        ip_str   = f"  top_src=[{', '.join(ip_parts)}]" if ip_parts else ""
-    else:
-        status = f"{GREEN}✓  NORMAL{RESET}"
-        ip_str = ""
+    if label == "ALERT":
+        print(
+            f"[{timestamp}] ALERT  score={score:+.2f} "
+            f"pkts={packet_count} bytes={byte_count} "
+            f"cpu={cpu:.0f}% mem={mem:.0f}% "
+            f"top_src={_format_top_sources(feature_row.get('top_src_ips', []))}"
+        )
+        return
 
     print(
-        f"[{ts}] {status}  "
-        f"score={score:+.4f}  pkts={pkts}  bytes={total_b}  "
-        f"{CYAN}cpu={cpu:.1f}%  mem={mem:.1f}%{RESET}"
-        f"{ip_str}"
+        f"[{timestamp}] NORMAL score={score:+.2f} "
+        f"pkts={packet_count} bytes={byte_count} cpu={cpu:.0f}% mem={mem:.0f}%"
     )
 
 
-# ── Live detection ────────────────────────────────────────────────────────────
-
-def run_live(model, scaler, threshold: float, iface: str | None = None) -> None:
-    """
-    Start packet capture in a background daemon thread, then run the
-    detection loop in the foreground (main thread).
-
-    Thread model:
-        daemon thread → start_capture() → PACKET_QUEUE
-        main thread   → live_windows() drains PACKET_QUEUE → predict → output
-    """
-    # Start capture as daemon so it auto-stops when the main thread exits
+def run_live(
+    model,
+    scaler,
+    threshold: float = DEFAULT_THRESHOLD,
+    iface: str | None = None,
+    window_size: int = WINDOW_SECONDS,
+    log_path: str = DEFAULT_LOG_PATH,
+) -> None:
+    """Start live capture in a background thread and classify windows forever."""
     capture_thread = threading.Thread(
         target=start_capture,
-        kwargs={"iface": iface},
+        kwargs={"iface": iface, "save_path": None, "verbose": False},
+        name="packet-capture",
         daemon=True,
-        name="CaptureThread",
     )
     capture_thread.start()
 
     print(
-        f"[detect] Capture thread started\n"
-        f"[detect] Window = {WINDOW_SECONDS}s | Threshold = {threshold} | "
-        f"Log → {LOG_FILE}\n"
+        f"[detect] Live detection started on {iface or 'default interface'} "
+        f"with {window_size}s windows and threshold {threshold:+.2f}"
     )
-
-    # Prime psutil so the first cpu_percent() returns a real value not 0.0
     psutil.cpu_percent(interval=None)
 
-    # live_windows() is a generator in features.py — no monkey-patching needed
-    for feat in live_windows():
-        label, score = predict(model, scaler, feat, threshold)
-        cpu, mem     = get_resources()
-
-        print_window(feat, label, score, cpu, mem)
-
-        if label == "ANOMALY":
-            ts = datetime.fromtimestamp(
-                     feat.get("window_start", time.time())
-                 ).strftime("%Y-%m-%d %H:%M:%S")
-            log_alert(ts, score, feat)
+    for feature_row in live_windows(window_size=window_size):
+        label, score = predict(model, scaler, feature_row, threshold)
+        print_window(feature_row, score, label)
+        if label == "ALERT":
+            log_alert(feature_row, score, log_path=log_path)
 
 
-# ── Offline replay ────────────────────────────────────────────────────────────
-
-def run_replay(model, scaler, features_csv: str, threshold: float) -> None:
-    """
-    Replay a pre-computed features CSV through the detector.
-
-    Useful for:
-      - Testing against Kali attack captures without re-running live capture
-      - Comparing contamination values and thresholds reproducibly
-    """
-    df = pd.read_csv(features_csv)
-
-    missing = [c for c in FEATURE_COLS if c not in df.columns]
+def run_replay(
+    model,
+    scaler,
+    features_csv: str,
+    threshold: float = DEFAULT_THRESHOLD,
+    log_path: str = DEFAULT_LOG_PATH,
+) -> None:
+    """Replay pre-computed feature windows from CSV."""
+    frame = pd.read_csv(features_csv)
+    missing = [column for column in FEATURE_COLS if column not in frame.columns]
     if missing:
-        print(f"[detect] ERROR: features CSV missing columns: {missing}")
-        sys.exit(1)
+        raise ValueError(f"Replay CSV missing required columns: {missing}")
 
-    print(f"[detect] Replaying {len(df)} windows from {features_csv}")
-    print(f"[detect] Threshold = {threshold} | Log → {LOG_FILE}\n")
+    if "window_start" not in frame.columns:
+        frame["window_start"] = time.time()
+    if "top_src_ips" not in frame.columns:
+        frame["top_src_ips"] = "[]"
 
+    print(f"[detect] Replaying {len(frame)} windows from {features_csv}")
     psutil.cpu_percent(interval=None)
 
-    for _, row in df.iterrows():
-        feat  = row.to_dict()
-        # top_src_ips is not in a CSV — provide empty list so print_window works
-        feat.setdefault("top_src_ips", [])
-
-        label, score = predict(model, scaler, feat, threshold)
-        cpu, mem     = get_resources()
-
-        print_window(feat, label, score, cpu, mem)
-
-        if label == "ANOMALY":
-            ts = datetime.fromtimestamp(
-                     feat.get("window_start", time.time())
-                 ).strftime("%Y-%m-%d %H:%M:%S")
-            log_alert(ts, score, feat)
-
-        time.sleep(0.05)   # brief pause so output is readable in terminal
+    for row in frame.to_dict("records"):
+        label, score = predict(model, scaler, row, threshold)
+        print_window(row, score, label)
+        if label == "ALERT":
+            log_alert(row, score, log_path=log_path)
+        time.sleep(0.05)
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run live or replay IDS detection")
+    parser.add_argument("--model", default=DEFAULT_MODEL_PATH, help="Path to ids_model.pkl")
+    parser.add_argument("--scaler", default=DEFAULT_SCALER_PATH, help="Path to scaler.pkl")
+    parser.add_argument("--iface", help="Capture interface name for live mode")
+    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="Anomaly score threshold")
+    parser.add_argument("--window", type=int, default=WINDOW_SECONDS, help="Live window size in seconds")
+    parser.add_argument("--replay", help="Optional features CSV for replay mode")
+    parser.add_argument("--log", default=DEFAULT_LOG_PATH, help="Alert log file path")
+    return parser
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="IDS real-time anomaly detector")
-    parser.add_argument("--model",     default="ids_model.pkl", metavar="PKL",
-                        help="Trained model path")
-    parser.add_argument("--scaler",    default="scaler.pkl",    metavar="PKL",
-                        help="Trained scaler path")
-    parser.add_argument("--iface",     default=None,            metavar="NAME",
-                        help="Network interface for live capture")
-    parser.add_argument("--replay",    default=None,            metavar="CSV",
-                        help="Replay a features CSV (offline mode)")
-    parser.add_argument("--threshold", default=DEFAULT_THRESHOLD, type=float,
-                        metavar="FLOAT",
-                        help=f"Anomaly score threshold (default: {DEFAULT_THRESHOLD})")
-    args = parser.parse_args()
-
+    args = build_parser().parse_args()
     model, scaler = load_artifacts(args.model, args.scaler)
 
-    if args.replay:
-        run_replay(model, scaler, args.replay, args.threshold)
-    else:
-        print("[detect] Live mode — press Ctrl+C to stop.\n")
-        try:
-            run_live(model, scaler, args.threshold, iface=args.iface)
-        except KeyboardInterrupt:
-            print("\n[detect] Stopped cleanly.")
+    try:
+        if args.replay:
+            run_replay(model, scaler, args.replay, threshold=args.threshold, log_path=args.log)
+        else:
+            run_live(
+                model,
+                scaler,
+                threshold=args.threshold,
+                iface=args.iface,
+                window_size=args.window,
+                log_path=args.log,
+            )
+    except KeyboardInterrupt:
+        print("\n[detect] Detection stopped.")
