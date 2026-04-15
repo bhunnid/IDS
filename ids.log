@@ -472,3 +472,48 @@
 2026-04-15 09:41:27 WARNING  ALERT: Anomaly detected (score=-0.059) | rate=2363.0pkt/s tcp=4649 udp=14 icmp=0 syn=5 src_ips=22 dst_ports=20
 2026-04-15 09:41:29 DEBUG    [DETECT] score=0.007  pkts=4163  rate=2081.5/s  syn=2  src_ips=26
 2026-04-15 09:41:31 WARNING  ALERT: Anomaly detected (score=-0.086) | rate=2430.0pkt/s tcp=4758 udp=27 icmp=0 syn=12 src_ips=23 dst_ports=21
+2026-04-15 09:41:33 WARNING  ALERT: Anomaly detected (score=-0.010) | rate=1906.0pkt/s tcp=3698 udp=23 icmp=0 syn=6 src_ips=29 dst_ports=23
+2026-04-15 09:41:36 WARNING  ALERT: Anomaly detected (score=-0.093) | rate=2829.5pkt/s tcp=5519 udp=33 icmp=0 syn=2 src_ips=21 dst_ports=16
+2026-04-15 09:41:38 WARNING  ALERT: Anomaly detected (score=-0.041) | rate=2272.0pkt/s tcp=4446 udp=21 icmp=0 syn=4 src_ips=22 dst_ports=16
+2026-04-15 09:41:40 WARNING  ALERT: Anomaly detected (score=-0.086) | rate=3076.0pkt/s tcp=6010 udp=38 icmp=0 syn=4 src_ips=28 dst_ports=14
+2026-04-15 09:41:42 WARNING  ALERT: Anomaly detected (score=-0.084) | rate=2472.0pkt/s tcp=4805 udp=46 icmp=0 syn=0 src_ips=19 dst_ports=14
+2026-04-15 09:41:44 WARNING  ALERT: Anomaly detected (score=-0.120) | rate=2836.0pkt/s tcp=5581 udp=10 icmp=0 syn=4 src_ips=19 dst_ports=12
+2026-04-15 09:41:46 WARNING  ALERT: Anomaly detected (score=-0.093) | rate=3484.5pkt/s tcp=6858 udp=21 icmp=0 syn=2 src_ips=21 dst_ports=14
+2026-04-15 09:41:48 WARNING  ALERT: Anomaly detected (score=-0.117) | rate=4445.5pkt/s tcp=8744 udp=38 icmp=0 syn=7 src_ips=31 dst_ports=22
+2026-04-15 09:41:51 WARNING  ALERT: Anomaly detected (score=-0.109) | rate=4119.5pkt/s tcp=8112 udp=52 icmp=0 syn=0 src_ips=26 dst_ports=16
+2026-04-15 09:41:53 WARNING  ALERT: Anomaly detected (score=-0.088) | rate=2948.5pkt/s tcp=5799 udp=22 icmp=0 syn=1 src_ips=19 dst_ports=16
+2026-04-15 09:41:55 DEBUG    [DETECT] score=0.121  pkts=1726  rate=863.0/s  syn=0  src_ips=22
+2026-04-15 09:41:57 DEBUG    [DETECT] score=0.084  pkts=1804  rate=902.0/s  syn=7  src_ips=35
+2026-04-15 09:41:59 DEBUG    [DETECT] score=0.116  pkts=2486  rate=1243.0/s  syn=1  src_ips=30
+2026-04-15 09:42:01 DEBUG    [DETECT] score=0.071  pkts=2612  rate=1306.0/s  syn=7  src_ips=28
+2026-04-15 09:42:03 DEBUG    [DETECT] score=0.119  pkts=1538  rate=769.0/s  syn=6  src_ips=30
+2026-04-15 09:42:05 DEBUG    [DETECT] score=0.074  pkts=2224  rate=1112.0/s  syn=3  src_ips=37
+2026-04-15 09:42:07 DEBUG    [DETECT] score=0.126  pkts=1867  rate=933.5/s  syn=2  src_ips=34
+2026-04-15 09:42:09 DEBUG    [DETECT] score=0.100  pkts=2152  rate=1076.0/s  syn=1  src_ips=31
+2026-04-15 09:42:11 DEBUG    [DETECT] score=0.089  pkts=2311  rate=1155.5/s  syn=2  src_ips=27
+2026-04-15 09:42:13 DEBUG    [DETECT] score=0.109  pkts=2296  rate=1148.0/s  syn=2  src_ips=18
+2026-04-15 09:42:15 DEBUG    [DETECT] score=0.077  pkts=2918  rate=1459.0/s  syn=0  src_ips=24
+2026-04-15 09:42:17 DEBUG    [DETECT] score=0.142  pkts=1748  rate=874.0/s  syn=2  src_ips=26
+2026-04-15 09:42:19 DEBUG    [DETECT] score=0.112  pkts=2262  rate=1131.0/s  syn=3  src_ips=21
+2026-04-15 09:42:21 DEBUG    [DETECT] score=0.091  pkts=2287  rate=1143.5/s  syn=1  src_ips=22
+2026-04-15 09:42:24 DEBUG    [DETECT] score=0.081  pkts=2766  rate=1383.0/s  syn=2  src_ips=19
+2026-04-15 09:42:26 DEBUG    [DETECT] score=0.056  pkts=3536  rate=1768.0/s  syn=3  src_ips=23
+2026-04-15 09:42:28 DEBUG    [DETECT] score=0.079  pkts=2609  rate=1304.5/s  syn=5  src_ips=31
+2026-04-15 09:42:30 DEBUG    [DETECT] score=0.040  pkts=3005  rate=1502.5/s  syn=7  src_ips=18
+2026-04-15 09:42:32 DEBUG    [DETECT] score=0.118  pkts=1927  rate=963.5/s  syn=2  src_ips=29
+2026-04-15 09:42:34 DEBUG    [DETECT] score=0.047  pkts=2062  rate=1031.0/s  syn=4  src_ips=35
+2026-04-15 09:42:36 DEBUG    [DETECT] score=0.069  pkts=2959  rate=1479.5/s  syn=2  src_ips=24
+2026-04-15 09:42:38 DEBUG    [DETECT] score=0.088  pkts=558  rate=279.0/s  syn=0  src_ips=40
+2026-04-15 09:42:40 DEBUG    [DETECT] score=0.172  pkts=783  rate=391.5/s  syn=3  src_ips=24
+2026-04-15 09:42:42 DEBUG    [DETECT] score=0.118  pkts=588  rate=294.0/s  syn=3  src_ips=38
+2026-04-15 09:42:44 DEBUG    [DETECT] score=0.135  pkts=658  rate=329.0/s  syn=3  src_ips=28
+2026-04-15 09:42:46 DEBUG    [DETECT] score=0.178  pkts=708  rate=354.0/s  syn=1  src_ips=26
+2026-04-15 09:42:48 DEBUG    [DETECT] score=0.168  pkts=623  rate=311.5/s  syn=1  src_ips=32
+2026-04-15 09:42:50 DEBUG    [DETECT] score=0.033  pkts=807  rate=403.5/s  syn=0  src_ips=46
+2026-04-15 09:42:52 DEBUG    [DETECT] score=0.145  pkts=626  rate=313.0/s  syn=0  src_ips=34
+2026-04-15 09:42:54 DEBUG    [DETECT] score=0.184  pkts=518  rate=259.0/s  syn=1  src_ips=25
+2026-04-15 09:42:56 DEBUG    [DETECT] score=0.175  pkts=815  rate=407.5/s  syn=3  src_ips=23
+2026-04-15 09:42:58 DEBUG    [DETECT] score=0.118  pkts=670  rate=335.0/s  syn=3  src_ips=39
+2026-04-15 09:43:00 INFO     Shutdown signal received (SIGINT).
+2026-04-15 09:43:00 INFO     IDS stopped. Windows processed: 389 | Alerts raised: 56
+2026-04-15 09:43:00 WARNING  ALERT: IDS stopped. Windows=389 Alerts=56
