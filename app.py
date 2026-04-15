@@ -1,17 +1,19 @@
 """
-UPGRADED IDS CONTROL PANEL
-- process watchdog
-- live streaming
-- structured alert parsing
-- health monitoring
+PRODUCTION-READY IDS CONTROL PANEL
+- thread-safe process management
+- stable alert streaming (SSE)
+- watchdog with auto-state correction
+- safe alert caching
+- improved health monitoring
 """
 
 import os
+import sys
 import threading
 import subprocess
 import time
 from datetime import datetime
-from flask import Flask, render_template_string, jsonify, request, Response
+from flask import Flask, render_template_string, jsonify, Response
 
 app = Flask(__name__)
 
@@ -26,108 +28,123 @@ HOST = "0.0.0.0"
 PORT = 5000
 
 # =========================
-# GLOBAL STATE
+# GLOBAL STATE (PROTECTED)
 # =========================
 lock = threading.Lock()
 
 proc = None
 start_time = None
-last_heartbeat = None
+running = False
 
 alerts_cache = []
-running = False
 
 
 # =========================
-# ALERT SYSTEM (FAST CACHE)
+# ALERT SYSTEM (THREAD SAFE)
 # =========================
 def load_alerts():
     global alerts_cache
+
     if not os.path.exists(ALERT_LOG):
-        return []
+        return alerts_cache
 
     try:
         with open(ALERT_LOG, "r", errors="ignore") as f:
             lines = f.readlines()
 
         cleaned = [l.strip() for l in lines if l.strip()]
-        alerts_cache = cleaned[-MAX_ALERTS:]
+
+        with lock:
+            alerts_cache = cleaned[-MAX_ALERTS:]
+
         return alerts_cache
-    except:
+
+    except Exception:
         return alerts_cache
 
 
 # =========================
-# PROCESS MANAGEMENT
+# PROCESS MANAGEMENT (SAFE)
 # =========================
 def start_ids():
     global proc, start_time, running
 
-    if proc and proc.poll() is None:
-        return False, "Already running"
+    with lock:
+        if proc and proc.poll() is None:
+            return False, "Already running"
 
-    proc = subprocess.Popen(
-        ["python", IDS_SCRIPT],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.STDOUT
-    )
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, IDS_SCRIPT],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            return False, f"Failed: {e}"
 
-    start_time = datetime.now()
-    running = True
+        start_time = datetime.now()
+        running = True
 
     threading.Thread(target=watchdog, daemon=True).start()
-
     return True, "Started"
 
 
 def stop_ids():
     global proc, running
 
-    if not proc:
-        return False, "Not running"
+    with lock:
+        if not proc:
+            return False, "Not running"
 
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except:
-        proc.kill()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
 
-    running = False
+        proc = None
+        running = False
+
     return True, "Stopped"
 
 
 # =========================
-# WATCHDOG (IMPORTANT FIX)
+# WATCHDOG
 # =========================
 def watchdog():
     global running, proc
 
-    while proc and proc.poll() is None:
-        time.sleep(5)
+    while True:
+        with lock:
+            if not proc:
+                running = False
+                return
 
-        # reload alerts constantly
+            alive = proc.poll() is None
+
+        if not alive:
+            with lock:
+                running = False
+                proc = None
+            return
+
         load_alerts()
-
-    running = False
+        time.sleep(3)
 
 
 # =========================
-# HEALTH CHECK (NEW)
+# HEALTH CHECK
 # =========================
 def get_health():
-    if not proc:
-        return "DOWN"
+    with lock:
+        if not proc:
+            return "DOWN"
 
-    if proc.poll() is not None:
-        return "STOPPED"
+        if proc.poll() is not None:
+            return "STOPPED"
 
-    # if IDS silent too long → degraded
-    try:
-        last = os.path.getmtime(ALERT_LOG)
-        if time.time() - last > 20:
-            return "DEGRADED"
-    except:
-        pass
+    if len(alerts_cache) == 0:
+        return "IDLE"
 
     return "OK"
 
@@ -165,12 +182,22 @@ def home():
         <button>Stop IDS</button>
     </form>
 
-    <h3>Alerts</h3>
+    <h3>Alerts (latest first)</h3>
     <div style="background:#111;color:#0f0;padding:10px;height:300px;overflow:auto;">
         {% for a in alerts %}
             <div>{{a}}</div>
         {% endfor %}
     </div>
+
+    <script>
+    const evt = new EventSource("/stream");
+    evt.onmessage = function(e) {
+        const box = document.querySelector("div");
+        const div = document.createElement("div");
+        div.textContent = e.data;
+        box.prepend(div);
+    };
+    </script>
     """,
     alerts=alerts_cache[::-1],
     running=running,
@@ -211,19 +238,27 @@ def alerts():
 
 
 # =========================
-# REAL-TIME STREAM (NEW)
+# REAL-TIME STREAM (FIXED)
 # =========================
 @app.get("/stream")
 def stream():
     def event_stream():
-        last_len = 0
+        last_len = len(alerts_cache)
+
         while True:
             load_alerts()
-            if len(alerts_cache) > last_len:
-                new = alerts_cache[last_len:]
-                for n in new:
-                    yield f"data: {n}\n\n"
-                last_len = len(alerts_cache)
+
+            with lock:
+                current_len = len(alerts_cache)
+                if current_len > last_len:
+                    new = alerts_cache[last_len:current_len]
+                    last_len = current_len
+                else:
+                    new = []
+
+            for n in new:
+                yield f"data: {n}\n\n"
+
             time.sleep(1)
 
     return Response(event_stream(), mimetype="text/event-stream")
@@ -233,4 +268,4 @@ def stream():
 # RUN
 # =========================
 if __name__ == "__main__":
-    app.run(host=HOST, port=PORT, debug=False)
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)
