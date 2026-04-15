@@ -1,1 +1,10 @@
-flask>=3.0
+
+---
+
+# 📦 `requirements.txt`
+
+```txt
+flask==3.0.0
+scapy==2.5.0
+numpy==1.26.4
+scikit-learn==1.4.2

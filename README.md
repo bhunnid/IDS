@@ -1,112 +1,110 @@
-# IDS Web Control Panel
+This project is a lightweight anomaly-based Intrusion Detection System (IDS) with a web-based control panel built using Flask. It monitors real-time network traffic using Scapy and detects anomalies using an Isolation Forest machine learning model.
 
-A minimal Flask-based web interface to start, stop, and monitor an
-anomaly-based Intrusion Detection System (IDS) running as a background process.
+The system is designed for small-scale networks and runs locally with minimal resource usage.
+
+- **ids_main.py**
+  - Captures live network traffic
+  - Extracts statistical features
+  - Trains Isolation Forest model
+  - Detects anomalies in real time
+  - Writes alerts to `alerts.log`
+
+- **app.py (Flask Control Panel)**
+  - Starts and stops IDS process
+  - Displays system status
+  - Streams alerts from log file
+  - Provides web-based monitoring interface
 
 ---
 
-## Project layout
+## Features
 
-```
-ids_panel/
-├── app.py           ← Flask control panel  (the only file you need to ship)
-├── ids_main.py      ← YOUR IDS entry point (stub provided for demo)
-├── alerts.log       ← Written by the IDS;  read by the panel (auto-created)
-└── requirements.txt
-```
+- Real-time network traffic monitoring
+- Anomaly detection using Isolation Forest
+- Lightweight statistical feature extraction
+- Web-based start/stop control panel
+- Live alert streaming via browser
+- Process isolation (IDS runs independently)
+- Automatic log tracking
 
 ---
 
-## Quick start
+## Requirements
 
-### 1 — Install dependencies (Python 3.9+)
+- Python 3.8+
+- Linux / Windows (Linux recommended for packet capture)
+
+---
+
+## Installation
 
 ```bash
+git clone <your-repo-url>
+cd <project-folder>
+
 pip install -r requirements.txt
-```
 
-Flask is the **only** external dependency.
-
----
-
-### 2 — Point the panel at your IDS
-
-| Env var      | Default        | Description                                      |
-|--------------|----------------|--------------------------------------------------|
-| `IDS_SCRIPT` | `ids_main.py`  | Path to your IDS Python entry point              |
-| `ALERT_LOG`  | `alerts.log`   | Path to the log file your IDS writes alerts into |
-| `MAX_ALERTS` | `100`          | Max alert lines kept in memory per request       |
-| `HOST`       | `0.0.0.0`      | Flask bind address                               |
-| `PORT`       | `5000`         | Flask port                                       |
-
-Example with your real IDS:
-
-```bash
-export IDS_SCRIPT=/opt/ids/main.py
-export ALERT_LOG=/var/log/ids/alerts.log
-```
-
----
-
-### 3 — Start the web server
-
-```bash
+Running the System
+1. Start Web Control Panel
 python app.py
-```
 
-Or with environment overrides inline:
+Then open:
 
-```bash
-IDS_SCRIPT=/opt/ids/main.py ALERT_LOG=/var/log/ids/alerts.log python app.py
-```
-
----
-
-### 4 — Open in browser
-
-```
 http://localhost:5000
-```
+2. Start IDS from Web UI
 
----
+Click:
 
-## Available endpoints
+▶ Start IDS
 
-| Method | Path       | Description                                |
-|--------|------------|--------------------------------------------|
-| GET    | `/`        | Main control panel page                    |
-| POST   | `/start`   | Start the IDS process                      |
-| POST   | `/stop`    | Stop the IDS process (SIGTERM → SIGKILL)   |
-| GET    | `/status`  | JSON: `{ running, uptime, started }`       |
-| GET    | `/alerts`  | JSON: last N alerts (`?n=50` adjustable)   |
+The system will:
 
----
+Launch ids_main.py
+Begin traffic monitoring
+Write alerts to alerts.log
+3. Stop IDS
 
-## Integration contract with your IDS
+Click:
 
-The panel makes **two** assumptions about your IDS:
+■ Stop IDS
+Direct IDS Execution (Optional)
 
-1. It is a **standalone Python script** launchable via `python <IDS_SCRIPT>`.
-2. It **appends alert lines** to the file at `ALERT_LOG`.
+You can run IDS without the web panel:
 
-No other changes to your IDS are required.
+python ids_main.py
+Configuration
 
----
+Edit inside ids_main.py:
 
-## Demo / testing without the real IDS
+WINDOW_SECONDS → feature window size
+TRAIN_SECONDS → baseline training time
+IF_CONTAMINATION → anomaly sensitivity
+INTERFACE → network interface (optional)
+Alert Format
+[YYYY-MM-DD HH:MM:SS] ALERT: Anomaly detected (score=-0.42) | rate=120 pkt/s ...
+Logs
+alerts.log → security alerts
+ids.log → system logs
+Testing
 
-A stub `ids_main.py` is included. It writes randomised fake alerts to
-`alerts.log` every few seconds so you can verify the panel end-to-end.
+Simulate traffic attacks using tools like:
 
-```bash
-python app.py          # uses ids_main.py + alerts.log by default
-# Open http://localhost:5000, click Start, watch alerts appear
-```
+hping3
+nping
+attack scripts (port scan, SYN flood)
 
----
+Example:
 
-## Security notes
+python attack_simulator.py
+Key Technologies
+Scapy (packet capture)
+Scikit-learn (Isolation Forest)
+Flask (web control panel)
+NumPy (feature processing)
+Safety Note
 
-- No authentication is provided (add a reverse-proxy like nginx + basic-auth
-  if the panel is exposed beyond localhost).
-- Tested with Python 3.10+ and Flask 3.x.
+This system is for educational and research use only. It should not be deployed in production environments without additional hardening.
+
+Author
+
+Final Year Project – Lightweight IDS for Small-Scale Networks
