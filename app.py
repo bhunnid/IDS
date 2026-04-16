@@ -82,57 +82,50 @@ _ALERT_RE = re.compile(
 )
 
 # Attack kind → severity + display label
-# New IDS format:  [YYYY-MM-DD HH:MM:SS] ALERT: <kind> | <detail>
 _KIND_META = {
-    # Attack alerts (match on kind field before the " | ")
-    "SYN flood / port scan": ("critical", "SYN Flood"),
-    "UDP flood":             ("critical", "UDP Flood"),
-    "ICMP flood":            ("critical", "ICMP Flood"),
-    "Volumetric DoS":        ("critical", "Vol. DoS"),
-    "Port scan":             ("high",     "Port Scan"),
-    # Lifecycle events
-    "IDS started":           ("info",     "Started"),
-    "IDS entered DETECTION mode": ("info", "Armed"),
-    "IDS stopped":           ("info",     "Stopped"),
+    "SYN flood / port scan":   ("critical", "SYN Flood"),
+    "ICMP flood":               ("critical", "ICMP Flood"),
+    "traffic volume spike":     ("high",     "Vol. Spike"),
+    "distributed scan / botnet":("critical", "Dist. Scan"),
+    "port sweep":               ("high",     "Port Sweep"),
+    "statistical anomaly":      ("medium",   "Anomaly"),
+    # lifecycle events
+    "IDS started":              ("info",     "Started"),
+    "IDS entered DETECTION":    ("info",     "Mode Change"),
+    "IDS stopped":              ("info",     "Stopped"),
 }
 
-
-def _classify(kind_str: str) -> tuple[str, str, str]:
-    """Map the kind field from the alert line to (kind, severity, label)."""
+def _classify(message: str) -> tuple[str, str, str]:
+    """
+    Returns (kind, severity, display_label) for a raw alert message body.
+    """
     for key, (sev, label) in _KIND_META.items():
-        if key.lower() in kind_str.lower():
+        if key.lower() in message.lower():
             return key, sev, label
-    return kind_str, "medium", "Alert"
+    # Fallback
+    return "statistical anomaly", "medium", "Anomaly"
 
 
 def _parse_alert_line(raw: str) -> dict | None:
-    """
-    Parse one raw log line into a structured alert dict, or None.
-    Format: [YYYY-MM-DD HH:MM:SS] ALERT: <kind> | <detail>
-    """
+    """Parse one raw log line into a structured alert dict, or None."""
     m = _ALERT_RE.match(raw.strip())
     if not m:
         return None
-    ts_str, full_body = m.group(1), m.group(2)
-
-    # Split on first " | " to separate kind from detail
-    if " | " in full_body:
-        kind_str, detail = full_body.split(" | ", 1)
-    else:
-        kind_str, detail = full_body, ""
-
-    kind, severity, label = _classify(kind_str)
-
-    # Extract numeric rate from detail if present
-    rate_m = re.search(r'(?:total_rate|udp_rate|syn_rate|icmp_rate|rate)=([\d.]+)', detail)
-    rate   = float(rate_m.group(1)) if rate_m else None
-
+    ts_str, body = m.group(1), m.group(2)
+    kind, severity, label = _classify(body)
+    # Extract score if present (score=-0.125)
+    score_match = re.search(r'score=(-?[\d.]+)', body)
+    score = float(score_match.group(1)) if score_match else None
+    # Extract rate if present
+    rate_match = re.search(r'rate=([\d.]+)pkt', body)
+    rate = float(rate_match.group(1)) if rate_match else None
     return {
         "ts":       ts_str,
-        "body":     full_body,
+        "body":     body,
         "kind":     kind,
         "severity": severity,
         "label":    label,
+        "score":    score,
         "rate":     rate,
     }
 
