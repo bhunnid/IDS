@@ -1,1063 +1,555 @@
 """
-IDS Web Control Panel — app.py
-================================
-Flask web interface to start, stop, and monitor the anomaly-based IDS.
-
-Improvements over v1
----------------------
-- /status  now returns IDS phase (training / detecting), alert counts by kind,
-  total windows processed, and last-alert timestamp — all parsed live from
-  alerts.log so the panel stays accurate even after restarts.
-- /alerts  returns structured JSON (timestamp, kind, detail, severity) instead
-  of raw lines, enabling the front-end to render rich, colour-coded cards.
-- /metrics returns time-series spark data (alert counts per 5-min bucket) for
-  the mini chart in the header.
-- /clear   POST endpoint to archive and wipe alerts.log from the UI.
-- Front-end: full dark terminal aesthetic with a live spark chart, per-kind
-  threat badges, severity colouring, and 5-second auto-polling (was 10 s).
-- Alert parsing understands every message the updated IDS emits:
-    IDS started, IDS entered DETECTION MODE, named attack kinds, IDS stopped.
-- Process management: watcher thread updates a _phase variable so the panel
-  can show TRAINING / DETECTING / STOPPED correctly without polling the log.
+app.py  —  IDS Web Control Panel
+Flask dashboard to start/stop ids_main.py and watch live alerts.
+No JS frameworks. Polls /status, /alerts, /metrics every 5 seconds.
 """
 
 import os
 import re
 import sys
+import time
 import threading
 import subprocess
-import time
-import json
 import collections
-from datetime import datetime, timezone
+from datetime import datetime
 from flask import Flask, render_template_string, jsonify, request
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration
+# Config
 # ─────────────────────────────────────────────────────────────────────────────
-IDS_SCRIPT  = os.environ.get("IDS_SCRIPT",  "ids_main.py")
-ALERT_LOG   = os.environ.get("ALERT_LOG",   "alerts.log")
-MAX_ALERTS  = int(os.environ.get("MAX_ALERTS", 200))
-HOST        = os.environ.get("HOST", "0.0.0.0")
-PORT        = int(os.environ.get("PORT", 5000))
-
-# IDS config constants mirrored here for the UI progress bar
-IDS_TRAIN_SECONDS = int(os.environ.get("IDS_TRAIN_SECONDS", 300))
+IDS_SCRIPT        = os.environ.get("IDS_SCRIPT",  "ids_main.py")
+ALERT_LOG         = os.environ.get("ALERT_LOG",   "alerts.log")
+IDS_BASELINE_SECS = int(os.environ.get("IDS_BASELINE_SECS", 60))
+HOST              = os.environ.get("HOST", "0.0.0.0")
+PORT              = int(os.environ.get("PORT", 5000))
 
 app = Flask(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Process state  (protected by _lock)
+# Process state
 # ─────────────────────────────────────────────────────────────────────────────
 _lock        = threading.Lock()
-_ids_process = None          # subprocess.Popen or None
-_start_time  = None          # datetime when IDS last started
-_stop_reason = "Never started"
-_ids_phase   = "stopped"     # "stopped" | "training" | "detecting"
+_proc        = None
+_start_time  = None
+_phase       = "stopped"   # stopped | baseline | detecting
+_stop_reason = "Not started"
 
 
-def _ids_is_running() -> bool:
+def _running() -> bool:
     with _lock:
-        return _ids_process is not None and _ids_process.poll() is None
+        return _proc is not None and _proc.poll() is None
 
 
-def _watcher(proc: subprocess.Popen):
-    """Daemon thread: cleans up state when IDS process exits for any reason."""
-    global _ids_process, _stop_reason, _ids_phase
+def _watcher(proc):
+    global _proc, _phase, _stop_reason
     proc.wait()
     with _lock:
-        if _ids_process is proc:
+        if _proc is proc:
             _stop_reason = f"Exited (code {proc.returncode})"
-            _ids_process = None
-            _ids_phase   = "stopped"
+            _proc  = None
+            _phase = "stopped"
 
+
+def _uptime() -> str:
+    with _lock:
+        st = _start_time
+    if st and _running():
+        s = int((datetime.now() - st).total_seconds())
+        h, r = divmod(s, 3600); m, sec = divmod(r, 60)
+        return f"{h:02d}:{m:02d}:{sec:02d}"
+    return ""
+
+
+def _baseline_pct() -> float:
+    with _lock:
+        st    = _start_time
+        phase = _phase
+    if phase != "baseline" or st is None:
+        return 1.0
+    return min((datetime.now() - st).total_seconds() / IDS_BASELINE_SECS, 0.99)
+
+
+def _current_phase() -> str:
+    if not _running():
+        return "stopped"
+    # Check the log to see if we've graduated from baseline
+    if os.path.exists(ALERT_LOG):
+        try:
+            with open(ALERT_LOG) as f:
+                content = f.read()
+            if "DETECTION mode" in content:
+                return "detecting"
+        except OSError:
+            pass
+    with _lock:
+        return _phase
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Alert log parsing
+# Alert parsing
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Matches: [2024-11-01 14:32:05] ALERT: <message>
-_ALERT_RE = re.compile(
-    r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+ALERT:\s+(.+)$'
-)
+_RE = re.compile(r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+ALERT:\s+(.+)$')
 
-# Attack kind → severity + display label
-_KIND_META = {
-    "SYN flood / port scan":   ("critical", "SYN Flood"),
-    "ICMP flood":               ("critical", "ICMP Flood"),
-    "traffic volume spike":     ("high",     "Vol. Spike"),
-    "distributed scan / botnet":("critical", "Dist. Scan"),
-    "port sweep":               ("high",     "Port Sweep"),
-    "statistical anomaly":      ("medium",   "Anomaly"),
-    # lifecycle events
-    "IDS started":              ("info",     "Started"),
-    "IDS entered DETECTION":    ("info",     "Mode Change"),
-    "IDS stopped":              ("info",     "Stopped"),
+_KINDS = {
+    "SYN flood":        ("critical", "SYN Flood",   "#ff4560"),
+    "UDP flood":        ("critical", "UDP Flood",   "#ff4560"),
+    "ICMP flood":       ("critical", "ICMP Flood",  "#ff4560"),
+    "Volumetric DoS":   ("critical", "Vol. DoS",    "#ff4560"),
+    "Port scan":        ("high",     "Port Scan",   "#ffb300"),
+    "IDS started":      ("info",     "Started",     "#4a6a85"),
+    "DETECTION mode":   ("info",     "Armed",       "#4a6a85"),
+    "IDS stopped":      ("info",     "Stopped",     "#4a6a85"),
 }
 
-def _classify(message: str) -> tuple[str, str, str]:
-    """
-    Returns (kind, severity, display_label) for a raw alert message body.
-    """
-    for key, (sev, label) in _KIND_META.items():
-        if key.lower() in message.lower():
-            return key, sev, label
-    # Fallback
-    return "statistical anomaly", "medium", "Anomaly"
 
-
-def _parse_alert_line(raw: str) -> dict | None:
-    """Parse one raw log line into a structured alert dict, or None."""
-    m = _ALERT_RE.match(raw.strip())
+def _parse(raw: str) -> dict | None:
+    m = _RE.match(raw.strip())
     if not m:
         return None
-    ts_str, body = m.group(1), m.group(2)
-    kind, severity, label = _classify(body)
-    # Extract score if present (score=-0.125)
-    score_match = re.search(r'score=(-?[\d.]+)', body)
-    score = float(score_match.group(1)) if score_match else None
-    # Extract rate if present
-    rate_match = re.search(r'rate=([\d.]+)pkt', body)
-    rate = float(rate_match.group(1)) if rate_match else None
-    return {
-        "ts":       ts_str,
-        "body":     body,
-        "kind":     kind,
-        "severity": severity,
-        "label":    label,
-        "score":    score,
-        "rate":     rate,
-    }
+    ts, body = m.group(1), m.group(2)
+    kind_str = body.split(" | ")[0] if " | " in body else body
+    detail   = body.split(" | ", 1)[1] if " | " in body else ""
+
+    sev, label, color = "medium", "Alert", "#b060ff"
+    for key, (s, l, c) in _KINDS.items():
+        if key.lower() in kind_str.lower():
+            sev, label, color = s, l, c
+            break
+
+    return {"ts": ts, "body": body, "kind": kind_str,
+            "severity": sev, "label": label, "color": color, "detail": detail}
 
 
 def _read_alerts(n: int = 100) -> list[dict]:
-    """Return the last *n* structured alerts, newest first."""
     if not os.path.exists(ALERT_LOG):
         return []
     try:
-        with open(ALERT_LOG, "r", errors="replace") as fh:
-            lines = fh.readlines()
+        with open(ALERT_LOG, errors="replace") as f:
+            lines = f.readlines()
     except OSError:
         return []
-    parsed = []
+    out = []
     for line in reversed(lines):
-        a = _parse_alert_line(line)
+        a = _parse(line)
         if a:
-            parsed.append(a)
-            if len(parsed) >= n:
+            out.append(a)
+            if len(out) >= n:
                 break
-    return parsed
+    return out
 
 
-def _alert_counts() -> dict:
-    """Count alerts by severity across the whole log (for stats bar)."""
-    counts = {"critical": 0, "high": 0, "medium": 0, "info": 0}
+def _counts() -> dict:
+    c = {"critical": 0, "high": 0, "medium": 0, "info": 0}
     if not os.path.exists(ALERT_LOG):
-        return counts
+        return c
     try:
-        with open(ALERT_LOG, "r", errors="replace") as fh:
-            for line in fh:
-                a = _parse_alert_line(line)
-                if a and a["severity"] in counts:
-                    counts[a["severity"]] += 1
+        with open(ALERT_LOG, errors="replace") as f:
+            for line in f:
+                a = _parse(line)
+                if a and a["severity"] in c:
+                    c[a["severity"]] += 1
     except OSError:
         pass
-    return counts
+    return c
 
 
-def _spark_data(buckets: int = 24, bucket_minutes: int = 5) -> list[int]:
-    """
-    Return alert counts per time bucket (excluding info) for the spark chart.
-    buckets=24, bucket_minutes=5 → last 2 hours at 5-min resolution.
-    """
+def _spark(buckets: int = 24, mins: int = 5) -> list[int]:
     result = [0] * buckets
     if not os.path.exists(ALERT_LOG):
         return result
     now = datetime.now()
     try:
-        with open(ALERT_LOG, "r", errors="replace") as fh:
-            for line in fh:
-                a = _parse_alert_line(line)
+        with open(ALERT_LOG, errors="replace") as f:
+            for line in f:
+                a = _parse(line)
                 if not a or a["severity"] == "info":
                     continue
                 try:
-                    ts = datetime.strptime(a["ts"], "%Y-%m-%d %H:%M:%S")
+                    ts  = datetime.strptime(a["ts"], "%Y-%m-%d %H:%M:%S")
+                    idx = int((now - ts).total_seconds() / 60 / mins)
+                    if 0 <= idx < buckets:
+                        result[idx] += 1
                 except ValueError:
-                    continue
-                diff_minutes = (now - ts).total_seconds() / 60
-                idx = int(diff_minutes / bucket_minutes)
-                if 0 <= idx < buckets:
-                    result[idx] += 1
+                    pass
     except OSError:
         pass
-    # Reverse so index 0 = oldest, last = newest
     return list(reversed(result))
 
-
-def _uptime_str() -> str:
-    if _start_time and _ids_is_running():
-        secs = int((datetime.now() - _start_time).total_seconds())
-        h, r = divmod(secs, 3600)
-        m, s = divmod(r, 60)
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return ""
-
-
-def _training_progress() -> float:
-    """0.0–1.0 fraction through training phase, or 1.0 if not training."""
-    with _lock:
-        phase = _ids_phase
-        st    = _start_time
-    if phase != "training" or st is None:
-        return 1.0
-    elapsed = (datetime.now() - st).total_seconds()
-    return min(elapsed / IDS_TRAIN_SECONDS, 0.99)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# HTML Template
+# Template
 # ─────────────────────────────────────────────────────────────────────────────
-TEMPLATE = r"""<!DOCTYPE html>
+
+TMPL = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>IDS Control Panel</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IDS Panel</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;400;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#06090d;--bg2:#0b1017;--surf:#0f1923;--brd:#1a2535;--brd2:#243040;
+  --txt:#b8cfe0;--mut:#3a5570;--dim:#1e3045;
+  --grn:#00d48a;--red:#ff3d57;--amb:#f59e0b;--blu:#38b2ff;--vio:#a855f7;
+  --font:'IBM Plex Mono',monospace;--ui:'IBM Plex Sans',sans-serif;
+}
+html,body{height:100%;background:var(--bg);color:var(--txt);font-family:var(--ui)}
+/* scanlines */
+body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.06) 3px,rgba(0,0,0,.06) 4px);pointer-events:none;z-index:9999}
 
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+/* Layout */
+.wrap{max-width:1120px;margin:0 auto;padding:1.5rem 1rem 4rem;display:grid;gap:1.1rem}
+/* Header */
+.hdr{display:flex;justify-content:space-between;align-items:center;padding-bottom:1rem;border-bottom:1px solid var(--brd)}
+.logo{font-family:var(--font);font-size:1rem;color:var(--blu);letter-spacing:.15em;display:flex;align-items:center;gap:.6rem}
+.logo-ring{width:10px;height:10px;border-radius:50%;border:2px solid var(--blu);box-shadow:0 0 10px var(--blu);animation:glow 2s ease-in-out infinite}
+@keyframes glow{0%,100%{box-shadow:0 0 4px var(--blu)}50%{box-shadow:0 0 18px var(--blu),0 0 35px rgba(56,178,255,.3)}}
+.hdr-right{font-family:var(--font);font-size:.72rem;color:var(--mut);text-align:right;line-height:1.7}
+#clock{color:var(--txt)}
 
-:root {
-  --bg:       #070b0f;
-  --bg2:      #0d1520;
-  --surface:  #111a27;
-  --border:   #1e2d40;
-  --border2:  #243447;
-  --text:     #c8d8e8;
-  --muted:    #4a6a85;
-  --dim:      #2a4060;
+/* Stat pills */
+.pills{display:grid;grid-template-columns:repeat(4,1fr) 240px;gap:.8rem;align-items:stretch}
+.pill{background:var(--surf);border:1px solid var(--brd);border-radius:6px;padding:.6rem .9rem}
+.pill-label{font-family:var(--font);font-size:.6rem;letter-spacing:.12em;text-transform:uppercase;color:var(--mut);margin-bottom:.2rem}
+.pill-val{font-size:1.6rem;font-weight:600;line-height:1}
+.crit{color:var(--red)}.high{color:var(--amb)}.med{color:var(--vio)}.info{color:var(--mut)}
+.spark-wrap{background:var(--surf);border:1px solid var(--brd);border-radius:6px;padding:.6rem .9rem}
+#spark{display:block;width:100%;height:42px;margin-top:.3rem}
 
-  --green:    #00e5a0;
-  --green-d:  rgba(0,229,160,.12);
-  --red:      #ff4560;
-  --red-d:    rgba(255,69,96,.12);
-  --amber:    #ffb300;
-  --amber-d:  rgba(255,179,0,.1);
-  --blue:     #38b6ff;
-  --blue-d:   rgba(56,182,255,.1);
-  --violet:   #b060ff;
-  --violet-d: rgba(176,96,255,.1);
+/* Main grid */
+.main{display:grid;grid-template-columns:270px 1fr;gap:1.1rem;align-items:start}
 
-  --mono: 'Share Tech Mono', monospace;
-  --ui:   'Barlow Condensed', sans-serif;
-}
+/* Card */
+.card{background:var(--surf);border:1px solid var(--brd);border-radius:6px;overflow:hidden}
+.card-hdr{padding:.6rem 1rem;border-bottom:1px solid var(--brd);font-family:var(--font);font-size:.6rem;letter-spacing:.14em;text-transform:uppercase;color:var(--mut);display:flex;justify-content:space-between;align-items:center}
+.card-body{padding:1rem}
 
-html { scroll-behavior: smooth; }
+/* Phase badge */
+.badge{display:flex;align-items:center;gap:.5rem;padding:.4rem .8rem;border-radius:4px;font-family:var(--font);font-size:.75rem;letter-spacing:.06em;text-transform:uppercase;border:1px solid;margin-bottom:.9rem;justify-content:center}
+.badge-stopped {background:rgba(255,61,87,.07);color:var(--red);border-color:rgba(255,61,87,.3)}
+.badge-baseline{background:rgba(245,158,11,.07);color:var(--amb);border-color:rgba(245,158,11,.3)}
+.badge-detecting{background:rgba(0,212,138,.07);color:var(--grn);border-color:rgba(0,212,138,.3)}
+.dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.dot-stopped {background:var(--red)}
+.dot-baseline{background:var(--amb);animation:blink .8s step-end infinite}
+.dot-detecting{background:var(--grn);box-shadow:0 0 7px var(--grn)}
+@keyframes blink{50%{opacity:0}}
 
-body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--ui);
-  font-weight: 400;
-  min-height: 100vh;
-  padding: 0;
-  /* scanline texture */
-  background-image: repeating-linear-gradient(
-    0deg,
-    transparent,
-    transparent 2px,
-    rgba(0,0,0,.08) 2px,
-    rgba(0,0,0,.08) 4px
-  );
-}
+/* Progress */
+.prog-wrap{margin-bottom:.9rem;display:none}
+.prog-wrap.show{display:block}
+.prog-labels{display:flex;justify-content:space-between;font-family:var(--font);font-size:.65rem;color:var(--mut);margin-bottom:.25rem}
+.prog-track{height:4px;background:var(--dim);border-radius:2px;overflow:hidden}
+.prog-bar{height:100%;background:linear-gradient(90deg,var(--amb),var(--blu));border-radius:2px;transition:width .8s}
 
-/* ── Layout ──────────────────────────────────── */
-.layout {
-  max-width: 1100px;
-  margin: 0 auto;
-  padding: 1.5rem 1.2rem 3rem;
-  display: grid;
-  grid-template-rows: auto auto 1fr;
-  gap: 1.2rem;
-}
+/* Meta table */
+.meta{width:100%;border-collapse:collapse;font-family:var(--font);font-size:.7rem;margin-bottom:.9rem}
+.meta td{padding:.3rem 0;border-bottom:1px solid var(--brd)}
+.meta td:first-child{color:var(--mut);width:45%}
+.meta td:last-child{color:var(--txt);text-align:right}
 
-/* ── Header ──────────────────────────────────── */
-.hdr {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  align-items: center;
-  gap: 1rem;
-  border-bottom: 1px solid var(--border);
-  padding-bottom: 1.1rem;
-}
-.hdr-left { display: flex; align-items: baseline; gap: .9rem; }
-.hdr-logo {
-  font-family: var(--mono);
-  font-size: 1.05rem;
-  color: var(--blue);
-  letter-spacing: .15em;
-  text-transform: uppercase;
-  display: flex;
-  align-items: center;
-  gap: .5rem;
-}
-.hdr-logo::before {
-  content: '';
-  display: inline-block;
-  width: 10px; height: 10px;
-  border: 2px solid var(--blue);
-  border-radius: 50%;
-  box-shadow: 0 0 8px var(--blue);
-  animation: pulse-ring 2s ease-in-out infinite;
-}
-@keyframes pulse-ring {
-  0%,100% { box-shadow: 0 0 4px var(--blue); }
-  50%      { box-shadow: 0 0 14px var(--blue), 0 0 30px rgba(56,182,255,.3); }
-}
-.hdr-sub {
-  font-family: var(--mono);
-  font-size: .7rem;
-  color: var(--muted);
-}
-.hdr-right {
-  font-family: var(--mono);
-  font-size: .75rem;
-  color: var(--muted);
-  text-align: right;
-  line-height: 1.6;
-}
-#clock { color: var(--text); }
+/* Buttons */
+.btns{display:flex;flex-direction:column;gap:.6rem}
+.btn{width:100%;padding:.55rem;border:1px solid;border-radius:4px;font-family:var(--ui);font-size:.85rem;font-weight:600;letter-spacing:.05em;text-transform:uppercase;cursor:pointer;transition:opacity .12s,box-shadow .12s}
+.btn:disabled{opacity:.25;cursor:not-allowed}
+.btn:not(:disabled):hover{opacity:.8}
+.btn-start{background:rgba(0,212,138,.08);color:var(--grn);border-color:rgba(0,212,138,.4)}
+.btn-start:not(:disabled):hover{box-shadow:0 0 14px rgba(0,212,138,.2)}
+.btn-stop{background:rgba(255,61,87,.08);color:var(--red);border-color:rgba(255,61,87,.4)}
+.btn-stop:not(:disabled):hover{box-shadow:0 0 14px rgba(255,61,87,.2)}
+.btn-clear{background:transparent;color:var(--mut);border-color:var(--brd);font-size:.75rem}
+.flash{margin-top:.7rem;padding:.4rem .6rem;border-radius:4px;font-family:var(--font);font-size:.7rem;border:1px solid}
+.ok{color:var(--grn);background:rgba(0,212,138,.07);border-color:rgba(0,212,138,.3)}
+.err{color:var(--red);background:rgba(255,61,87,.07);border-color:rgba(255,61,87,.3)}
 
-/* ── Spark row ───────────────────────────────── */
-.spark-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1fr 1fr auto;
-  gap: .8rem;
-  align-items: center;
-}
-.stat-pill {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: .55rem .9rem;
-  display: flex;
-  flex-direction: column;
-  gap: .15rem;
-}
-.stat-pill .sp-label {
-  font-size: .62rem;
-  letter-spacing: .12em;
-  text-transform: uppercase;
-  color: var(--muted);
-  font-family: var(--mono);
-}
-.stat-pill .sp-val {
-  font-size: 1.5rem;
-  font-weight: 700;
-  line-height: 1;
-  font-family: var(--ui);
-}
-.sp-crit  { color: var(--red); }
-.sp-high  { color: var(--amber); }
-.sp-med   { color: var(--violet); }
-.sp-info  { color: var(--muted); }
+/* Feed */
+.feed-hdr{display:flex;justify-content:space-between;align-items:center}
+.feed-controls{display:flex;align-items:center;gap:.6rem}
+.live-dot{width:6px;height:6px;border-radius:50%;background:var(--grn);box-shadow:0 0 5px var(--grn);animation:blink .9s step-end infinite}
+.live-dot.paused{background:var(--mut);box-shadow:none;animation:none}
+.feed-count{font-family:var(--font);font-size:.65rem;color:var(--mut)}
+.fbtn{background:none;border:1px solid var(--brd);border-radius:3px;color:var(--mut);font-family:var(--font);font-size:.65rem;padding:.15rem .5rem;cursor:pointer}
+.fbtn:hover{color:var(--txt);border-color:var(--brd2)}
+.filters{display:flex;gap:.3rem}
+.ftab{background:none;border:1px solid var(--brd);border-radius:3px;color:var(--mut);font-family:var(--font);font-size:.62rem;padding:.15rem .45rem;cursor:pointer;text-transform:uppercase;letter-spacing:.05em}
+.ftab.on{background:var(--brd2);color:var(--txt);border-color:var(--brd2)}
 
-#spark-wrap {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: .55rem .9rem;
-  min-width: 200px;
-}
-#spark-wrap .sp-label {
-  font-size: .62rem;
-  letter-spacing: .12em;
-  text-transform: uppercase;
-  color: var(--muted);
-  font-family: var(--mono);
-  margin-bottom: .35rem;
-}
-#spark-canvas { display: block; width: 100%; height: 40px; }
+/* Alert cards */
+.feed-list{max-height:calc(100vh - 280px);min-height:280px;overflow-y:auto;padding:.4rem;scrollbar-width:thin;scrollbar-color:var(--brd) transparent}
+.feed-list::-webkit-scrollbar{width:4px}
+.feed-list::-webkit-scrollbar-thumb{background:var(--brd);border-radius:2px}
+.acard{display:grid;grid-template-columns:28px 1fr auto;gap:.5rem;align-items:start;padding:.6rem .7rem;border-radius:4px;border:1px solid var(--brd);border-left:3px solid;margin-bottom:.4rem;background:var(--bg2);animation:fadein .2s ease;font-family:var(--font);font-size:.7rem}
+@keyframes fadein{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+.acard:hover{border-color:var(--brd2)}
+.ac-icon{font-size:1rem;line-height:1;padding-top:.05rem}
+.ac-kind{font-size:.68rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;margin-bottom:.18rem}
+.ac-detail{color:var(--mut);font-size:.65rem;line-height:1.5;word-break:break-all}
+.ac-ts{color:var(--dim);font-size:.62rem;white-space:nowrap;text-align:right}
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;height:200px;color:var(--dim);font-family:var(--font);font-size:.75rem;gap:.4rem}
+.empty-icon{font-size:2rem;opacity:.3}
 
-/* ── Main grid ───────────────────────────────── */
-.main-grid {
-  display: grid;
-  grid-template-columns: 280px 1fr;
-  gap: 1.2rem;
-  align-items: start;
-}
-
-/* ── Card ────────────────────────────────────── */
-.card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  overflow: hidden;
-}
-.card-head {
-  padding: .65rem 1rem;
-  border-bottom: 1px solid var(--border);
-  font-size: .65rem;
-  letter-spacing: .15em;
-  text-transform: uppercase;
-  color: var(--muted);
-  font-family: var(--mono);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.card-body { padding: 1rem; }
-
-/* ── Status panel (left column) ─────────────── */
-.status-block { margin-bottom: 1rem; }
-
-.phase-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: .5rem;
-  padding: .4rem .9rem;
-  border-radius: 3px;
-  font-family: var(--mono);
-  font-size: .8rem;
-  letter-spacing: .08em;
-  font-weight: 600;
-  text-transform: uppercase;
-  border: 1px solid;
-  width: 100%;
-  justify-content: center;
-  margin-bottom: .8rem;
-}
-.phase-stopped  { background: rgba(255,69,96,.08);   color: var(--red);   border-color: rgba(255,69,96,.3);  }
-.phase-training { background: rgba(255,179,0,.08);   color: var(--amber); border-color: rgba(255,179,0,.3);  }
-.phase-detecting{ background: rgba(0,229,160,.08);   color: var(--green); border-color: rgba(0,229,160,.3);  }
-
-.dot {
-  width: 7px; height: 7px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-.dot-stopped  { background: var(--red); }
-.dot-training { background: var(--amber);
-  animation: blink .9s step-end infinite; }
-.dot-detecting{ background: var(--green);
-  box-shadow: 0 0 6px var(--green); }
-@keyframes blink { 50% { opacity: 0; } }
-
-/* Training progress bar */
-.progress-wrap {
-  margin-bottom: .9rem;
-  display: none;
-}
-.progress-wrap.visible { display: block; }
-.progress-label {
-  display: flex;
-  justify-content: space-between;
-  font-size: .68rem;
-  color: var(--muted);
-  font-family: var(--mono);
-  margin-bottom: .3rem;
-}
-.progress-track {
-  height: 4px;
-  background: var(--border);
-  border-radius: 2px;
-  overflow: hidden;
-}
-.progress-bar {
-  height: 100%;
-  background: linear-gradient(90deg, var(--amber), var(--blue));
-  border-radius: 2px;
-  transition: width .8s ease;
-}
-
-/* Meta rows */
-.meta-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: .3rem 0;
-  border-bottom: 1px solid var(--border);
-  font-size: .78rem;
-}
-.meta-row:last-child { border-bottom: none; }
-.meta-key { color: var(--muted); font-family: var(--mono); font-size: .7rem; }
-.meta-val { color: var(--text);  font-family: var(--mono); font-size: .75rem; text-align: right; }
-.meta-val.good  { color: var(--green); }
-.meta-val.bad   { color: var(--red);   }
-.meta-val.warn  { color: var(--amber); }
-
-/* Controls */
-.btn-row {
-  display: flex;
-  flex-direction: column;
-  gap: .6rem;
-  margin-top: .8rem;
-}
-.btn {
-  width: 100%;
-  padding: .6rem 1rem;
-  border: 1px solid;
-  border-radius: 3px;
-  font-family: var(--ui);
-  font-size: .9rem;
-  font-weight: 600;
-  letter-spacing: .06em;
-  text-transform: uppercase;
-  cursor: pointer;
-  transition: opacity .12s, box-shadow .12s;
-}
-.btn:disabled { opacity: .3; cursor: not-allowed; }
-.btn:not(:disabled):hover { opacity: .8; }
-
-.btn-start {
-  background: var(--green-d);
-  color: var(--green);
-  border-color: rgba(0,229,160,.4);
-}
-.btn-start:not(:disabled):hover {
-  box-shadow: 0 0 14px rgba(0,229,160,.25);
-}
-.btn-stop {
-  background: var(--red-d);
-  color: var(--red);
-  border-color: rgba(255,69,96,.4);
-}
-.btn-stop:not(:disabled):hover {
-  box-shadow: 0 0 14px rgba(255,69,96,.2);
-}
-.btn-clear {
-  background: transparent;
-  color: var(--muted);
-  border-color: var(--border);
-  font-size: .78rem;
-}
-.btn-clear:not(:disabled):hover { color: var(--text); border-color: var(--border2); }
-
-.flash {
-  margin-top: .6rem;
-  font-size: .75rem;
-  font-family: var(--mono);
-  padding: .4rem .6rem;
-  border-radius: 3px;
-  border: 1px solid;
-}
-.flash-ok  { color: var(--green); background: var(--green-d); border-color: rgba(0,229,160,.3); }
-.flash-err { color: var(--red);   background: var(--red-d);   border-color: rgba(255,69,96,.3); }
-
-/* ── Alert feed (right column) ──────────────── */
-.alert-feed {
-  max-height: calc(100vh - 260px);
-  min-height: 300px;
-  overflow-y: auto;
-  padding: .5rem;
-  scrollbar-width: thin;
-  scrollbar-color: var(--border) transparent;
-}
-.alert-feed::-webkit-scrollbar { width: 4px; }
-.alert-feed::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-
-.alert-card {
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  gap: .5rem .8rem;
-  align-items: start;
-  padding: .65rem .75rem;
-  border-radius: 4px;
-  border: 1px solid var(--border);
-  margin-bottom: .45rem;
-  font-family: var(--mono);
-  font-size: .73rem;
-  background: var(--bg2);
-  transition: border-color .15s;
-  animation: slide-in .2s ease;
-}
-@keyframes slide-in {
-  from { opacity:0; transform: translateY(-4px); }
-  to   { opacity:1; transform: translateY(0); }
-}
-.alert-card:hover { border-color: var(--border2); }
-
-.alert-card.sev-critical { border-left: 3px solid var(--red);    background: rgba(255,69,96,.04);  }
-.alert-card.sev-high     { border-left: 3px solid var(--amber);  background: rgba(255,179,0,.03);  }
-.alert-card.sev-medium   { border-left: 3px solid var(--violet); background: rgba(176,96,255,.03); }
-.alert-card.sev-info     { border-left: 3px solid var(--dim);    background: transparent; }
-
-.ac-icon { font-size: 1rem; line-height: 1; padding-top: .05rem; }
-.ac-body { min-width: 0; }
-.ac-kind { font-size: .7rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; margin-bottom: .2rem; }
-.ac-kind.sev-critical { color: var(--red);    }
-.ac-kind.sev-high     { color: var(--amber);  }
-.ac-kind.sev-medium   { color: var(--violet); }
-.ac-kind.sev-info     { color: var(--muted);  }
-.ac-detail { color: var(--muted); line-height: 1.4; font-size: .68rem; word-break: break-all; }
-.ac-ts { color: var(--dim); font-size: .65rem; white-space: nowrap; text-align: right; }
-
-.empty-state {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  height: 200px;
-  color: var(--dim);
-  font-family: var(--mono);
-  font-size: .78rem;
-  gap: .4rem;
-}
-.empty-icon { font-size: 2rem; opacity: .3; }
-
-/* Feed controls */
-.feed-controls {
-  display: flex;
-  align-items: center;
-  gap: .6rem;
-}
-.fc-dot {
-  width: 6px; height: 6px;
-  border-radius: 50%;
-  background: var(--green);
-  box-shadow: 0 0 5px var(--green);
-  animation: blink .9s step-end infinite;
-}
-.fc-dot.paused { background: var(--dim); box-shadow: none; animation: none; }
-.fc-count { font-size: .68rem; color: var(--muted); font-family: var(--mono); }
-.fc-btn {
-  background: none;
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  color: var(--muted);
-  font-size: .68rem;
-  font-family: var(--mono);
-  padding: .15rem .5rem;
-  cursor: pointer;
-}
-.fc-btn:hover { color: var(--text); border-color: var(--border2); }
-
-/* Filter tabs */
-.filter-tabs {
-  display: flex;
-  gap: .3rem;
-}
-.ftab {
-  background: none;
-  border: 1px solid var(--border);
-  border-radius: 2px;
-  color: var(--muted);
-  font-size: .65rem;
-  font-family: var(--mono);
-  padding: .15rem .45rem;
-  cursor: pointer;
-  letter-spacing: .05em;
-  text-transform: uppercase;
-  transition: all .12s;
-}
-.ftab.active { background: var(--border2); color: var(--text); border-color: var(--border2); }
-
-/* ── Responsive ──────────────────────────────── */
-@media (max-width: 720px) {
-  .main-grid { grid-template-columns: 1fr; }
-  .spark-row { grid-template-columns: 1fr 1fr; }
-  #spark-wrap { grid-column: 1 / -1; }
-}
+@media(max-width:760px){.main{grid-template-columns:1fr}.pills{grid-template-columns:1fr 1fr}}
 </style>
 </head>
 <body>
-<div class="layout">
+<div class="wrap">
 
-  <!-- ── Header ──────────────────────────────── -->
-  <header class="hdr">
-    <div class="hdr-left">
-      <div class="hdr-logo">IDS Console</div>
-      <span class="hdr-sub">anomaly detection system</span>
-    </div>
-    <div class="hdr-right">
-      <div id="clock"></div>
-      <div>{{ alert_log }}</div>
-    </div>
-  </header>
+<!-- Header -->
+<header class="hdr">
+  <div class="logo"><div class="logo-ring"></div>IDS CONSOLE</div>
+  <div class="hdr-right"><div id="clock"></div><div>{{ alert_log }}</div></div>
+</header>
 
-  <!-- ── Spark / stat row ─────────────────────── -->
-  <div class="spark-row">
-    <div class="stat-pill">
-      <span class="sp-label">Critical</span>
-      <span class="sp-val sp-crit" id="cnt-critical">{{ counts.critical }}</span>
-    </div>
-    <div class="stat-pill">
-      <span class="sp-label">High</span>
-      <span class="sp-val sp-high" id="cnt-high">{{ counts.high }}</span>
-    </div>
-    <div class="stat-pill">
-      <span class="sp-label">Medium</span>
-      <span class="sp-val sp-med" id="cnt-medium">{{ counts.medium }}</span>
-    </div>
-    <div class="stat-pill">
-      <span class="sp-label">Info</span>
-      <span class="sp-val sp-info" id="cnt-info">{{ counts.info }}</span>
-    </div>
-    <div id="spark-wrap">
-      <div class="sp-label">Alerts / 5 min — last 2 h</div>
-      <canvas id="spark-canvas" width="200" height="40"></canvas>
+<!-- Stat pills -->
+<div class="pills">
+  <div class="pill"><div class="pill-label">Critical</div><div class="pill-val crit" id="cnt-critical">{{ counts.critical }}</div></div>
+  <div class="pill"><div class="pill-label">High</div><div class="pill-val high" id="cnt-high">{{ counts.high }}</div></div>
+  <div class="pill"><div class="pill-label">Medium</div><div class="pill-val med" id="cnt-medium">{{ counts.medium }}</div></div>
+  <div class="pill"><div class="pill-label">Info</div><div class="pill-val info" id="cnt-info">{{ counts.info }}</div></div>
+  <div class="spark-wrap">
+    <div class="pill-label">Alerts / 5 min — last 2 h</div>
+    <canvas id="spark" width="200" height="42"></canvas>
+  </div>
+</div>
+
+<!-- Main -->
+<div class="main">
+
+  <!-- Left: status + controls -->
+  <div class="card">
+    <div class="card-hdr">System</div>
+    <div class="card-body">
+
+      <div id="badge" class="badge badge-{{ phase }}">
+        <span class="dot dot-{{ phase }}"></span>
+        <span id="badge-txt">{{ phase_label }}</span>
+      </div>
+
+      <div id="prog-wrap" class="prog-wrap {{ 'show' if phase == 'baseline' else '' }}">
+        <div class="prog-labels"><span>Baseline</span><span id="prog-pct">{{ "%.0f"|format(bpct*100) }}%</span></div>
+        <div class="prog-track"><div id="prog-bar" class="prog-bar" style="width:{{ "%.1f"|format(bpct*100) }}%"></div></div>
+      </div>
+
+      <table class="meta">
+        <tr><td>Uptime</td><td id="uptime">{{ uptime or "—" }}</td></tr>
+        <tr><td>PID</td><td id="pid">{{ pid or "—" }}</td></tr>
+        <tr><td>Script</td><td>{{ ids_script }}</td></tr>
+        <tr><td>Log</td><td>{{ alert_log }}</td></tr>
+        <tr><td>Last alert</td><td id="last-ts">{{ last_ts or "—" }}</td></tr>
+      </table>
+
+      <div class="btns">
+        <form method="POST" action="/start" style="margin:0">
+          <button class="btn btn-start" {{ "disabled" if running else "" }}>▶ Start IDS</button>
+        </form>
+        <form method="POST" action="/stop" style="margin:0">
+          <button class="btn btn-stop" {{ "disabled" if not running else "" }}>■ Stop IDS</button>
+        </form>
+        <form method="POST" action="/clear" style="margin:0">
+          <button class="btn btn-clear">⊘ Clear log</button>
+        </form>
+      </div>
+
+      {% if flash %}
+      <div class="flash {{ 'ok' if ok else 'err' }}">{{ flash }}</div>
+      {% endif %}
     </div>
   </div>
 
-  <!-- ── Main grid ────────────────────────────── -->
-  <div class="main-grid">
-
-    <!-- Left: status + controls -->
-    <div>
-      <div class="card">
-        <div class="card-head">System</div>
-        <div class="card-body">
-          <div class="status-block">
-            <div id="phase-badge" class="phase-badge phase-{{ phase }}">
-              <span class="dot dot-{{ phase }}"></span>
-              <span id="phase-text">{{ phase_label }}</span>
-            </div>
-
-            <!-- Training progress bar (visible only during training) -->
-            <div id="progress-wrap" class="progress-wrap {{ 'visible' if phase == 'training' else '' }}">
-              <div class="progress-label">
-                <span>Baseline training</span>
-                <span id="progress-pct">{{ "%.0f"|format(train_progress * 100) }}%</span>
-              </div>
-              <div class="progress-track">
-                <div id="progress-bar" class="progress-bar"
-                     style="width: {{ "%.1f"|format(train_progress * 100) }}%"></div>
-              </div>
-            </div>
-
-            <div class="meta-row">
-              <span class="meta-key">uptime</span>
-              <span class="meta-val" id="uptime">{{ uptime or '—' }}</span>
-            </div>
-            <div class="meta-row">
-              <span class="meta-key">script</span>
-              <span class="meta-val">{{ ids_script }}</span>
-            </div>
-            <div class="meta-row">
-              <span class="meta-key">log</span>
-              <span class="meta-val">{{ alert_log }}</span>
-            </div>
-            <div class="meta-row">
-              <span class="meta-key">pid</span>
-              <span class="meta-val" id="pid-val">{{ pid or '—' }}</span>
-            </div>
-            <div class="meta-row">
-              <span class="meta-key">last alert</span>
-              <span class="meta-val warn" id="last-alert-ts">{{ last_alert_ts or '—' }}</span>
-            </div>
-          </div>
-
-          <div class="btn-row">
-            <form method="POST" action="/start" style="margin:0">
-              <button class="btn btn-start" {{ 'disabled' if running else '' }}>
-                ▶ Start IDS
-              </button>
-            </form>
-            <form method="POST" action="/stop" style="margin:0">
-              <button class="btn btn-stop" {{ 'disabled' if not running else '' }}>
-                ■ Stop IDS
-              </button>
-            </form>
-            <form method="POST" action="/clear" style="margin:0">
-              <button class="btn btn-clear">⊘ Clear alert log</button>
-            </form>
-          </div>
-
-          {% if flash_msg %}
-          <div class="flash {{ 'flash-ok' if flash_ok else 'flash-err' }}">
-            {{ flash_msg }}
-          </div>
-          {% endif %}
-        </div>
+  <!-- Right: alert feed -->
+  <div class="card" style="display:flex;flex-direction:column">
+    <div class="card-hdr">
+      <div class="feed-controls">
+        <div class="live-dot" id="live-dot"></div>
+        <span class="feed-count" id="feed-count">{{ alerts|length }} alerts</span>
+        <button class="fbtn" id="pause-btn" onclick="togglePause()">Pause</button>
+      </div>
+      <div class="filters">
+        <button class="ftab on"  onclick="setF('all',this)">All</button>
+        <button class="ftab" onclick="setF('critical',this)">Critical</button>
+        <button class="ftab" onclick="setF('high',this)">High</button>
+        <button class="ftab" onclick="setF('medium',this)">Medium</button>
       </div>
     </div>
-
-    <!-- Right: alert feed -->
-    <div class="card" style="display:flex; flex-direction:column;">
-      <div class="card-head">
-        <div class="feed-controls">
-          <div class="fc-dot" id="live-dot"></div>
-          <span class="fc-count" id="feed-count">{{ alerts|length }} alerts</span>
-          <button class="fc-btn" id="pause-btn" onclick="togglePause()">Pause</button>
+    <div class="feed-list" id="feed">
+      {% if alerts %}
+        {% for a in alerts %}
+        <div class="acard" data-sev="{{ a.severity }}" style="border-left-color:{{ a.color }}">
+          <div class="ac-icon" style="color:{{ a.color }}">{{ {"critical":"⚠","high":"▲","medium":"◆","info":"·"}[a.severity] }}</div>
+          <div><div class="ac-kind" style="color:{{ a.color }}">{{ a.label }}</div><div class="ac-detail">{{ a.detail or a.body }}</div></div>
+          <div class="ac-ts">{{ a.ts[11:] }}</div>
         </div>
-        <div class="filter-tabs">
-          <button class="ftab active" onclick="setFilter('all',this)">All</button>
-          <button class="ftab" onclick="setFilter('critical',this)">Critical</button>
-          <button class="ftab" onclick="setFilter('high',this)">High</button>
-          <button class="ftab" onclick="setFilter('medium',this)">Medium</button>
-        </div>
-      </div>
-
-      <div class="alert-feed" id="alert-feed">
-        {% if alerts %}
-          {% for a in alerts %}
-          <div class="alert-card sev-{{ a.severity }}" data-sev="{{ a.severity }}">
-            <div class="ac-icon">{{ {'critical':'⚠', 'high':'▲', 'medium':'◆', 'info':'·'}[a.severity] }}</div>
-            <div class="ac-body">
-              <div class="ac-kind sev-{{ a.severity }}">{{ a.label }}</div>
-              <div class="ac-detail">{{ a.body }}</div>
-            </div>
-            <div class="ac-ts">{{ a.ts[11:] }}</div>
-          </div>
-          {% endfor %}
-        {% else %}
-          <div class="empty-state">
-            <div class="empty-icon">◎</div>
-            <div>No alerts yet</div>
-          </div>
-        {% endif %}
-      </div>
+        {% endfor %}
+      {% else %}
+        <div class="empty"><div class="empty-icon">◎</div><div>No alerts yet</div></div>
+      {% endif %}
     </div>
+  </div>
 
-  </div><!-- /main-grid -->
-</div><!-- /layout -->
+</div><!-- /main -->
+</div><!-- /wrap -->
 
 <script>
-// ── Clock ───────────────────────────────────────────────────────────────────
-function tick() {
-  const d = new Date();
-  document.getElementById('clock').textContent =
-    d.toLocaleDateString() + ' ' + d.toLocaleTimeString();
-}
-tick(); setInterval(tick, 1000);
+// Clock
+const clockEl = document.getElementById('clock');
+function tick(){ clockEl.textContent = new Date().toLocaleString(); }
+tick(); setInterval(tick,1000);
 
-// ── Spark chart ─────────────────────────────────────────────────────────────
-let sparkData = {{ spark | tojson }};
-
-function drawSpark(data) {
-  const canvas = document.getElementById('spark-canvas');
-  if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const W = canvas.offsetWidth || 200;
-  const H = 40;
-  canvas.width = W; canvas.height = H;
-  ctx.clearRect(0, 0, W, H);
-  const max = Math.max(...data, 1);
-  const bw  = W / data.length;
-  data.forEach((v, i) => {
-    const h = (v / max) * (H - 4);
-    const x = i * bw;
-    const intense = v > 0 ? Math.min(v / max, 1) : 0;
-    ctx.fillStyle = intense > 0.6
-      ? `rgba(255,69,96,${0.4 + intense * 0.5})`
-      : intense > 0.2
-        ? `rgba(255,179,0,${0.3 + intense * 0.5})`
-        : `rgba(56,182,255,${0.15 + intense * 0.4})`;
-    ctx.fillRect(x + 1, H - h, bw - 2, h);
+// Spark
+let sparkData = {{ spark|tojson }};
+function drawSpark(d){
+  const c = document.getElementById('spark');
+  if(!c) return;
+  const W = c.offsetWidth||200, H=42, max=Math.max(...d,1);
+  c.width=W; c.height=H;
+  const ctx=c.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+  const bw=W/d.length;
+  d.forEach((v,i)=>{
+    const h=(v/max)*(H-4), x=i*bw, t=v/max;
+    ctx.fillStyle=t>.6?`rgba(255,61,87,${.4+t*.5})`:t>.2?`rgba(245,158,11,${.3+t*.5})`:`rgba(56,178,255,${.15+t*.4})`;
+    ctx.fillRect(x+1,H-h,bw-2,h);
   });
 }
 drawSpark(sparkData);
-window.addEventListener('resize', () => drawSpark(sparkData));
+window.addEventListener('resize',()=>drawSpark(sparkData));
 
-// ── Filter ──────────────────────────────────────────────────────────────────
-let activeFilter = 'all';
-function setFilter(f, el) {
-  activeFilter = f;
-  document.querySelectorAll('.ftab').forEach(b => b.classList.remove('active'));
-  el.classList.add('active');
-  applyFilter();
+// Filter
+let activeF='all';
+function setF(f,el){
+  activeF=f;
+  document.querySelectorAll('.ftab').forEach(b=>b.classList.remove('on'));
+  el.classList.add('on');
+  applyF();
 }
-function applyFilter() {
-  document.querySelectorAll('#alert-feed .alert-card').forEach(card => {
-    card.style.display =
-      (activeFilter === 'all' || card.dataset.sev === activeFilter) ? '' : 'none';
+function applyF(){
+  document.querySelectorAll('#feed .acard').forEach(c=>{
+    c.style.display=(activeF==='all'||c.dataset.sev===activeF)?'':'none';
   });
 }
 
-// ── Pause ───────────────────────────────────────────────────────────────────
-let paused = false;
-function togglePause() {
-  paused = !paused;
-  const btn = document.getElementById('pause-btn');
-  const dot = document.getElementById('live-dot');
-  btn.textContent = paused ? 'Resume' : 'Pause';
-  dot.classList.toggle('paused', paused);
+// Pause
+let paused=false;
+function togglePause(){
+  paused=!paused;
+  document.getElementById('pause-btn').textContent=paused?'Resume':'Pause';
+  document.getElementById('live-dot').classList.toggle('paused',paused);
 }
 
-// ── Severity icon map ────────────────────────────────────────────────────────
-const SEV_ICON = { critical: '⚠', high: '▲', medium: '◆', info: '·' };
-
-// ── Build alert card HTML ────────────────────────────────────────────────────
-function buildCard(a) {
-  const icon = SEV_ICON[a.severity] || '·';
-  const ts   = a.ts ? a.ts.slice(11) : '';
-  return `<div class="alert-card sev-${esc(a.severity)}" data-sev="${esc(a.severity)}">
-    <div class="ac-icon">${icon}</div>
-    <div class="ac-body">
-      <div class="ac-kind sev-${esc(a.severity)}">${esc(a.label)}</div>
-      <div class="ac-detail">${esc(a.body)}</div>
-    </div>
-    <div class="ac-ts">${esc(ts)}</div>
+// Helpers
+const ICONS={critical:'⚠',high:'▲',medium:'◆',info:'·'};
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function card(a){
+  return `<div class="acard" data-sev="${esc(a.severity)}" style="border-left-color:${esc(a.color)}">
+    <div class="ac-icon" style="color:${esc(a.color)}">${ICONS[a.severity]||'·'}</div>
+    <div><div class="ac-kind" style="color:${esc(a.color)}">${esc(a.label)}</div><div class="ac-detail">${esc(a.detail||a.body)}</div></div>
+    <div class="ac-ts">${esc(a.ts?a.ts.slice(11):'')}</div>
   </div>`;
 }
 
-function esc(s) {
-  return String(s)
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;');
-}
+// Polling
+const PHASE_LABELS={stopped:'Stopped',baseline:'Baseline…',detecting:'Detecting'};
+let lastTs='';
+async function poll(){
+  try{
+    const [sr,ar,mr]=await Promise.all([fetch('/status'),fetch('/alerts?n=100'),fetch('/metrics')]);
+    const st=await sr.json(), al=await ar.json(), mt=await mr.json();
 
-// ── Polling ──────────────────────────────────────────────────────────────────
-let lastTs = '';    // ts of most recent alert seen
+    // Phase badge
+    const bdg=document.getElementById('badge');
+    const bt=document.getElementById('badge-txt');
+    bdg.className='badge badge-'+st.phase;
+    bdg.querySelector('.dot').className='dot dot-'+st.phase;
+    bt.textContent=PHASE_LABELS[st.phase]||st.phase;
 
-async function poll() {
-  try {
-    const [sRes, aRes, mRes] = await Promise.all([
-      fetch('/status'),
-      fetch('/alerts?n=100'),
-      fetch('/metrics'),
-    ]);
-    const status  = await sRes.json();
-    const aData   = await aRes.json();
-    const metrics = await mRes.json();
+    // Uptime / pid
+    document.getElementById('uptime').textContent=st.uptime||'—';
+    document.getElementById('pid').textContent=st.pid||'—';
 
-    // ── Phase badge ───────────────────────────────────────────────────────
-    const badge = document.getElementById('phase-badge');
-    const ptext = document.getElementById('phase-text');
-    const upEl  = document.getElementById('uptime');
-    const pidEl = document.getElementById('pid-val');
-
-    badge.className = 'phase-badge phase-' + status.phase;
-    badge.querySelector('.dot').className = 'dot dot-' + status.phase;
-    const LABELS = { stopped:'Stopped', training:'Training…', detecting:'Detecting' };
-    ptext.textContent = LABELS[status.phase] || status.phase;
-    upEl.textContent = status.uptime || '—';
-    pidEl.textContent = status.pid || '—';
-
-    // ── Training progress bar ─────────────────────────────────────────────
-    const pw  = document.getElementById('progress-wrap');
-    const pb  = document.getElementById('progress-bar');
-    const pct = document.getElementById('progress-pct');
-    if (status.phase === 'training') {
-      pw.classList.add('visible');
-      const p = Math.min((status.train_progress || 0) * 100, 99);
-      pb.style.width = p.toFixed(1) + '%';
-      pct.textContent = p.toFixed(0) + '%';
+    // Progress bar
+    const pw=document.getElementById('prog-wrap');
+    const pb=document.getElementById('prog-bar');
+    const pp=document.getElementById('prog-pct');
+    if(st.phase==='baseline'){
+      pw.classList.add('show');
+      const p=Math.min((st.baseline_pct||0)*100,99);
+      pb.style.width=p.toFixed(1)+'%'; pp.textContent=p.toFixed(0)+'%';
     } else {
-      pw.classList.remove('visible');
+      pw.classList.remove('show');
     }
 
-    // ── Stat pills ────────────────────────────────────────────────────────
-    const c = metrics.counts || {};
-    ['critical','high','medium','info'].forEach(k => {
-      const el = document.getElementById('cnt-' + k);
-      if (el) el.textContent = c[k] ?? 0;
+    // Counts
+    const c=mt.counts||{};
+    ['critical','high','medium','info'].forEach(k=>{
+      const el=document.getElementById('cnt-'+k);
+      if(el) el.textContent=c[k]??0;
     });
 
-    // ── Spark ─────────────────────────────────────────────────────────────
-    if (metrics.spark) { sparkData = metrics.spark; drawSpark(sparkData); }
+    // Spark
+    if(mt.spark){sparkData=mt.spark;drawSpark(sparkData);}
 
-    // ── Last alert ts ──────────────────────────────────────────────────────
-    const lts = document.getElementById('last-alert-ts');
-    if (aData.alerts && aData.alerts.length) {
-      const first = aData.alerts[0];
-      lts.textContent = first.ts ? first.ts.slice(11) : '—';
+    // Last alert ts
+    if(al.alerts&&al.alerts.length){
+      const first=al.alerts.find(a=>a.severity!=='info');
+      document.getElementById('last-ts').textContent=first?first.ts.slice(11):'—';
     }
 
-    // ── Alert feed ────────────────────────────────────────────────────────
-    if (!paused && aData.alerts) {
-      const feed    = document.getElementById('alert-feed');
-      const cnt     = document.getElementById('feed-count');
-      const newAlerts = aData.alerts.filter(a => a.severity !== 'info' || true);
-
-      // Only re-render if newest alert changed
-      const newestTs = newAlerts.length ? newAlerts[0].ts : '';
-      if (newestTs !== lastTs) {
-        lastTs = newestTs;
-        if (newAlerts.length === 0) {
-          feed.innerHTML = `<div class="empty-state"><div class="empty-icon">◎</div><div>No alerts yet</div></div>`;
+    // Feed
+    if(!paused&&al.alerts){
+      const feed=document.getElementById('feed');
+      const newestTs=al.alerts.length?al.alerts[0].ts:'';
+      if(newestTs!==lastTs){
+        lastTs=newestTs;
+        const cnt=document.getElementById('feed-count');
+        if(!al.alerts.length){
+          feed.innerHTML='<div class="empty"><div class="empty-icon">◎</div><div>No alerts yet</div></div>';
+          cnt.textContent='0 alerts';
         } else {
-          feed.innerHTML = newAlerts.map(buildCard).join('');
-          applyFilter();
+          feed.innerHTML=al.alerts.map(card).join('');
+          cnt.textContent=al.alerts.length+' alert'+(al.alerts.length!==1?'s':'');
+          applyF();
         }
-        cnt.textContent = newAlerts.length + ' alert' + (newAlerts.length !== 1 ? 's' : '');
       }
     }
-
-  } catch(e) { /* network blip — stay silent */ }
+  } catch(e){}
 }
-
-poll();
-setInterval(poll, 5000);
+poll(); setInterval(poll,5000);
 </script>
 </body>
 </html>"""
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Render helper
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _current_phase() -> str:
-    """
-    Derive the IDS phase from process state + alert log.
-    Priority: process state first, then fall back to log content.
-    """
+def _render(flash="", ok=True):
+    run    = _running()
+    phase  = _current_phase()
+    alerts = _read_alerts(100)
+    labels = {"stopped": "Stopped", "baseline": "Baseline…", "detecting": "Detecting"}
     with _lock:
-        phase = _ids_phase
-        proc  = _ids_process
-
-    if not _ids_is_running():
-        return "stopped"
-
-    # If the IDS wrote a DETECTION MODE line, it has graduated from training
-    if os.path.exists(ALERT_LOG):
-        try:
-            with open(ALERT_LOG, "r", errors="replace") as fh:
-                content = fh.read()
-            if "DETECTION MODE" in content or "entered DETECTION" in content:
-                return "detecting"
-        except OSError:
-            pass
-
-    return phase  # "training" by default while running
-
-
-def _last_alert_ts() -> str | None:
-    """Return the timestamp string of the most recent non-info alert."""
-    alerts = _read_alerts(10)
-    for a in alerts:
-        if a["severity"] != "info":
-            return a["ts"][11:]   # HH:MM:SS portion
-    return None
-
-
-def _render(flash_msg="", flash_ok=True):
-    running  = _ids_is_running()
-    phase    = _current_phase()
-    alerts   = _read_alerts(100)
-    counts   = _alert_counts()
-    spark    = _spark_data()
-
-    phase_labels = {
-        "stopped":   "Stopped",
-        "training":  "Training…",
-        "detecting": "Detecting",
-    }
-
-    with _lock:
-        proc = _ids_process
-        pid  = proc.pid if proc else None
+        p   = _proc
+        pid = p.pid if p else None
+    lts = next((a["ts"][11:] for a in alerts if a["severity"] != "info"), None)
 
     return render_template_string(
-        TEMPLATE,
-        running        = running,
-        phase          = phase,
-        phase_label    = phase_labels.get(phase, phase.title()),
-        uptime         = _uptime_str(),
-        pid            = pid,
-        alerts         = alerts,
-        counts         = counts,
-        spark          = spark,
-        alert_log      = ALERT_LOG,
-        ids_script     = IDS_SCRIPT,
-        last_alert_ts  = _last_alert_ts(),
-        train_progress = _training_progress(),
-        flash_msg      = flash_msg,
-        flash_ok       = flash_ok,
+        TMPL,
+        running    = run,
+        phase      = phase,
+        phase_label= labels.get(phase, phase.title()),
+        uptime     = _uptime(),
+        pid        = pid,
+        bpct       = _baseline_pct(),
+        alerts     = alerts,
+        counts     = _counts(),
+        spark      = _spark(),
+        alert_log  = ALERT_LOG,
+        ids_script = IDS_SCRIPT,
+        last_ts    = lts,
+        flash      = flash,
+        ok         = ok,
     )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Routes
@@ -1069,116 +561,85 @@ def index():
 
 
 @app.post("/start")
-def start_ids():
-    global _ids_process, _ids_thread, _start_time, _stop_reason, _ids_phase
-
-    if _ids_is_running():
-        return _render("IDS is already running.", flash_ok=False)
-
+def start():
+    global _proc, _start_time, _phase, _stop_reason
+    if _running():
+        return _render("IDS is already running.", ok=False)
     if not os.path.exists(IDS_SCRIPT):
-        return _render(
-            f"Script not found: {IDS_SCRIPT!r} — set IDS_SCRIPT env var.",
-            flash_ok=False,
-        )
-
+        return _render(f"Script not found: {IDS_SCRIPT}", ok=False)
     try:
-        proc = subprocess.Popen(
+        p = subprocess.Popen(
             [sys.executable, IDS_SCRIPT],
-            stdout = subprocess.DEVNULL,
-            stderr = subprocess.DEVNULL,
-            close_fds = True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True,
         )
         with _lock:
-            _ids_process = proc
+            _proc        = p
             _start_time  = datetime.now()
+            _phase       = "baseline"
             _stop_reason = ""
-            _ids_phase   = "training"
-
-        t = threading.Thread(target=_watcher, args=(proc,), daemon=True)
-        t.start()
-        with _lock:
-            _ids_thread = t
-
-        return _render("IDS started — baseline training in progress.", flash_ok=True)
-    except Exception as exc:
-        return _render(f"Failed to start IDS: {exc}", flash_ok=False)
+        threading.Thread(target=_watcher, args=(p,), daemon=True).start()
+        return _render("IDS started — baseline phase running.", ok=True)
+    except Exception as e:
+        return _render(f"Failed to start: {e}", ok=False)
 
 
 @app.post("/stop")
-def stop_ids():
-    global _ids_process, _stop_reason, _ids_phase
-
-    if not _ids_is_running():
-        return _render("IDS is not running.", flash_ok=False)
-
+def stop():
+    global _proc, _phase, _stop_reason
+    if not _running():
+        return _render("IDS is not running.", ok=False)
     with _lock:
-        proc = _ids_process
-
+        p = _proc
     try:
-        proc.terminate()
+        p.terminate()
         try:
-            proc.wait(timeout=5)
+            p.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-
+            p.kill(); p.wait()
         with _lock:
-            _ids_process = None
-            _ids_phase   = "stopped"
+            _proc  = None; _phase = "stopped"
             _stop_reason = f"Stopped at {datetime.now().strftime('%H:%M:%S')}"
-
-        return _render("IDS stopped.", flash_ok=True)
-    except Exception as exc:
-        return _render(f"Error stopping IDS: {exc}", flash_ok=False)
+        return _render("IDS stopped.", ok=True)
+    except Exception as e:
+        return _render(f"Error: {e}", ok=False)
 
 
 @app.post("/clear")
-def clear_log():
-    """Archive alerts.log → alerts.log.bak and start fresh."""
+def clear():
     try:
         if os.path.exists(ALERT_LOG):
-            bak = ALERT_LOG + ".bak"
-            os.replace(ALERT_LOG, bak)
-        return _render(f"Alert log cleared (backup: {ALERT_LOG}.bak)", flash_ok=True)
-    except OSError as exc:
-        return _render(f"Could not clear log: {exc}", flash_ok=False)
+            os.replace(ALERT_LOG, ALERT_LOG + ".bak")
+        return _render("Log cleared (backup saved).", ok=True)
+    except OSError as e:
+        return _render(f"Could not clear log: {e}", ok=False)
 
 
 @app.get("/status")
 def status():
-    running  = _ids_is_running()
-    phase    = _current_phase()
+    phase = _current_phase()
     with _lock:
-        proc = _ids_process
-        st   = _start_time
-
+        p  = _proc
+        st = _start_time
     return jsonify({
-        "running":        running,
-        "phase":          phase,
-        "uptime":         _uptime_str(),
-        "started":        st.isoformat() if st and running else None,
-        "pid":            proc.pid if proc else None,
-        "train_progress": _training_progress(),
-        "stop_reason":    _stop_reason,
+        "running":      _running(),
+        "phase":        phase,
+        "uptime":       _uptime(),
+        "pid":          p.pid if p else None,
+        "baseline_pct": _baseline_pct(),
+        "stop_reason":  _stop_reason,
     })
 
 
 @app.get("/alerts")
-def alerts_route():
-    n = min(int(request.args.get("n", 100)), MAX_ALERTS)
-    return jsonify({
-        "alerts":    _read_alerts(n),
-        "log_file":  ALERT_LOG,
-        "timestamp": datetime.now().isoformat(),
-    })
+def alerts():
+    n = min(int(request.args.get("n", 100)), 200)
+    return jsonify({"alerts": _read_alerts(n), "log_file": ALERT_LOG})
 
 
 @app.get("/metrics")
 def metrics():
-    return jsonify({
-        "counts": _alert_counts(),
-        "spark":  _spark_data(),
-    })
+    return jsonify({"counts": _counts(), "spark": _spark()})
 
 
 # ─────────────────────────────────────────────────────────────────────────────

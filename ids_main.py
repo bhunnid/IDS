@@ -1,141 +1,105 @@
 """
-ids_main.py — Lightweight Anomaly-Based Intrusion Detection System
-===================================================================
+ids_main.py  —  Network Intrusion Detection System for Kali Linux
+==================================================================
+Captures live traffic using a raw AF_PACKET socket (no Scapy, no tcpdump,
+no external dependencies beyond the Python standard library).
 
 HOW IT WORKS
 ------------
-1. CAPTURE: Scapy sniffs all packets on the default network interface in a
-   background thread, storing them in a thread-safe rolling buffer.
+Phase 1 — BASELINE  (first 60 seconds, configurable)
+    The IDS listens silently and records the peak packet rates on your
+    network: total packets/s, SYN packets/s, UDP packets/s, ICMP packets/s.
+    Using p99 of all 3-second windows so one burst doesn't inflate the
+    baseline. DO NOT run an attack during this phase.
 
-2. FEATURE EXTRACTION: Every WINDOW_SECONDS (5 s), the main loop drains the
-   buffer and computes a lightweight feature vector for that window:
-       [packet_rate, tcp_count, udp_count, icmp_count, avg_pkt_size,
-        syn_count, unique_src_ips, unique_dst_ports]
+Phase 2 — DETECTION  (after baseline)
+    Five rules fire based on hard multiples of YOUR measured baseline peaks.
+    Traffic must exceed 8× your own normal peak (configurable) AND sustain
+    that level for 2 consecutive windows (6 seconds) before any alert fires.
+    A per-rule 60-second cooldown prevents alert storms.
 
-3. TRAINING PHASE (first TRAIN_SECONDS, default 300 s / 5 min): Feature
-   vectors are collected but no alerts are raised. A longer baseline is
-   critical on a private LAN — it must cover bursts from mDNS, ARP, NTP,
-   DHCP renewals, backup jobs, etc. so they are learned as "normal".
+RULES
+-----
+  SYN flood   : syn_rate  > baseline × 8  AND  >70% of TCP are SYNs
+  UDP flood   : udp_rate  > baseline × 8
+  ICMP flood  : icmp_rate > baseline × 8  (min floor: 50/s)
+  Vol. DoS    : total_rate > baseline × 8 (only if no protocol rule fires)
+  Port scan   : one IP touches ≥ 50 distinct ports in 3 seconds
 
-4. DETECTION PHASE: An Isolation Forest is trained on the baseline. Every new
-   feature vector is scored. Isolation Forest marks a sample as anomalous when
-   it is easily isolated (short average path length in random trees). The raw
-   model flag is NOT sufficient to fire an alert — three additional gates must
-   all pass:
+ALERT FORMAT  (appended to alerts.log)
+    [YYYY-MM-DD HH:MM:SS] ALERT: <kind> | <detail>
 
-   Gate 1 — SCORE DEPTH: the anomaly score must be below SCORE_THRESHOLD
-            (default -0.15). Scores just below 0.0 are borderline noise;
-            truly anomalous traffic scores well below -0.1.
+ATTACK SIMULATION (Kali tools)
+    SYN flood   : sudo hping3 -S --flood -V -p 80 <target-ip>
+    UDP flood   : sudo hping3 --udp --flood -p 53 <target-ip>
+    ICMP flood  : sudo hping3 --icmp --flood <target-ip>
+    Port scan   : sudo nmap -sS -p 1-1000 --min-rate 500 <target-ip>
+    Slowloris   : slowhttptest -c 500 -H -g -o output -i 10 -r 200 -t GET -u http://<target-ip>/
 
-   Gate 2 — CONFIRMATION STREAK: the window must be anomalous for
-            CONFIRM_WINDOWS consecutive windows (default 2) before an alert
-            fires. A single-window spike (e.g. a large download, a brief
-            broadcast storm) is suppressed.
-
-   Gate 3 — ALERT COOLDOWN: once an alert fires, no further alert fires for
-            ALERT_COOLDOWN_SECONDS (default 60 s). This prevents one attack
-            event from generating dozens of repeated lines.
-
-5. ADAPTIVE RE-TRAINING: The model is periodically re-trained on a rolling
-   window of recent *normal* windows so it adapts to legitimate traffic shifts
-   (e.g. a cron job, a video call) without requiring a restart.
-
-FALSE-POSITIVE TUNING GUIDE
-----------------------------
-Still too noisy?   Lower SCORE_THRESHOLD (e.g. -0.20) or raise CONFIRM_WINDOWS
-                   to 3.  Extend TRAIN_SECONDS to 600 s.
-Missing real attacks? Raise SCORE_THRESHOLD toward -0.10 or lower
-                   CONFIRM_WINDOWS to 1.
-
-RESOURCE USAGE
---------------
-- One background sniffer thread (Scapy) — woken only on packet arrival.
-- One main loop sleeping WINDOW_SECONDS between iterations.
-- Isolation Forest with 100 estimators on ≤3600 samples — negligible RAM/CPU.
-
-INTEGRATION CONTRACT
---------------------
-- Launchable as:  python ids_main.py
-- Alert output:   alerts.log  (one line per alert, appended)
-- Alert format:   [YYYY-MM-DD HH:MM:SS] ALERT: <description>
-- Info/debug:     ids.log     (rotation at 5 MB, 2 backups)
-- Terminate with: Ctrl-C or SIGTERM — shuts down cleanly.
+RUN
+    sudo python3 ids_main.py
 """
 
-# ── Standard library ────────────────────────────────────────────────────────
+import os
 import sys
 import time
 import signal
+import socket
+import struct
 import logging
 import threading
 import collections
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
-# ── Third-party ──────────────────────────────────────────────────────────────
-try:
-    import numpy as np
-except ImportError:
-    sys.exit("ERROR: numpy is required.  pip install numpy")
-
-try:
-    from sklearn.ensemble import IsolationForest
-except ImportError:
-    sys.exit("ERROR: scikit-learn is required.  pip install scikit-learn")
-
-try:
-    from scapy.all import sniff, IP, TCP, UDP, ICMP, conf as scapy_conf
-except ImportError:
-    sys.exit("ERROR: scapy is required.  pip install scapy")
-
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION  (tweak these values — no external config file needed)
+# CONFIGURATION  —  edit these if needed
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Capture / windowing ──────────────────────────────────────────────────────
-WINDOW_SECONDS        = 5        # seconds per feature window (longer = smoother)
-INTERFACE             = None     # None → Scapy default; or e.g. "eth0" / "en0"
+# Network interface to capture on. None = auto-detect first non-loopback iface.
+INTERFACE = None
 
-# ── Baseline training ────────────────────────────────────────────────────────
-TRAIN_SECONDS         = 300      # 5 minutes of baseline (cover normal LAN noise)
-MIN_TRAIN_SAMPLES     = 30       # don't train until we have this many windows
+# Seconds to observe normal traffic and build adaptive thresholds.
+BASELINE_SECONDS = 60
 
-# ── Isolation Forest ─────────────────────────────────────────────────────────
-IF_ESTIMATORS         = 100
-# contamination: fraction of training data expected to be anomalous.
-# 0.01 = 1% → model is conservative, only flags clear outliers.
-# Raise toward 0.05 only if you have reason to believe training traffic
-# included some genuinely bad traffic.
-IF_CONTAMINATION      = "auto"
+# Measurement window (seconds). Packets in this window form one data point.
+WINDOW_SECONDS = 3
 
-# ── Alert suppression — the three false-positive gates ──────────────────────
-# Gate 1: minimum anomaly score depth to even consider alerting.
-# IsolationForest scores: 0.0 = boundary, -1.0 = most anomalous.
-# -0.15 means the window must be clearly in anomaly territory, not borderline.
-SCORE_THRESHOLD       = -0.10
+# Alert when a metric exceeds this multiple of your own measured normal peak.
+# 8 = must be 8× your measured normal. Lower = more sensitive, higher = quieter.
+THRESHOLD_MULTIPLIER = 8
 
-# Gate 2: how many *consecutive* anomalous windows before an alert fires.
-# 2 windows × 5 s = 10 s of sustained anomaly required.
-CONFIRM_WINDOWS       = 2
+# Hard floors: alert regardless of baseline if these rates are exceeded.
+# These numbers represent traffic NO legitimate device ever sends.
+SYN_FLOOR   = 200    # SYN packets/s
+UDP_FLOOR   = 1000   # UDP packets/s
+ICMP_FLOOR  = 50     # ICMP packets/s
+TOTAL_FLOOR = 5000   # Total packets/s
 
-# Gate 3: minimum seconds between any two alerts (suppresses alert storms).
-ALERT_COOLDOWN_SECS   = 60
+# SYN flood: minimum fraction of TCP packets that must be SYNs.
+SYN_RATIO_MIN = 0.70
 
-# ── Adaptive re-training ─────────────────────────────────────────────────────
-RETRAIN_EVERY_WINDOWS = 180      # re-train every N normal windows (~15 min)
-NORMAL_HISTORY_SIZE   = 3600     # max normal windows kept for rolling re-train
+# Port scan: number of distinct destination ports from one IP in one window.
+PORT_SCAN_THRESHOLD = 50
 
-# ── File paths ───────────────────────────────────────────────────────────────
-ALERT_LOG             = "alerts.log"
-INFO_LOG              = "ids.log"
+# Consecutive windows a rule must fire before an alert is written.
+CONFIRM_WINDOWS = 2   # 2 × 3s = 6 seconds sustained
+
+# Seconds before the same rule can fire again.
+COOLDOWN_SECS = 60
+
+ALERT_LOG = "alerts.log"
+INFO_LOG  = "ids.log"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOGGING SETUP
+# LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _setup_logging():
-    fmt = logging.Formatter("%(asctime)s %(levelname)-8s %(message)s",
-                             datefmt="%Y-%m-%d %H:%M:%S")
+    fmt = logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
@@ -150,331 +114,415 @@ def _setup_logging():
     root.addHandler(ch)
 
 _setup_logging()
-log = logging.getLogger(__name__)
+log = logging.getLogger("ids")
 
 
-def _write_alert(msg: str):
-    """Append a timestamped alert line to alerts.log and the info log."""
+def write_alert(kind: str, detail: str):
     ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] ALERT: {msg}"
+    line = f"[{ts}] ALERT: {kind} | {detail}"
     try:
-        with open(ALERT_LOG, "a") as fh:
-            fh.write(line + "\n")
-    except OSError as exc:
-        log.error("Cannot write to %s: %s", ALERT_LOG, exc)
-    log.warning("ALERT: %s", msg)
-
+        with open(ALERT_LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        log.error("Cannot write alert file: %s", e)
+    log.warning(">>> ALERT: %s | %s", kind, detail)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PACKET BUFFER  (thread-safe)
+# INTERFACE DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
+
+def get_interface() -> str:
+    if INTERFACE:
+        return INTERFACE
+    # Pick first non-loopback interface from /proc/net/dev
+    try:
+        with open("/proc/net/dev") as f:
+            for line in f:
+                line = line.strip()
+                if ":" in line:
+                    iface = line.split(":")[0].strip()
+                    if iface != "lo":
+                        return iface
+    except OSError:
+        pass
+    return "eth0"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PACKET CAPTURE  —  pure Python AF_PACKET raw socket
+# ─────────────────────────────────────────────────────────────────────────────
+
+# IP protocol numbers
+PROTO_TCP  = 6
+PROTO_UDP  = 17
+PROTO_ICMP = 1
+
+# Ethernet type for IPv4
+ETH_P_IP   = 0x0800
+ETH_P_ALL  = 0x0003   # capture everything
+
+
+class Packet:
+    """Parsed packet — only fields the IDS needs."""
+    __slots__ = ("src_ip", "dst_ip", "proto", "dport", "is_syn")
+
+    def __init__(self, src_ip, dst_ip, proto, dport=0, is_syn=False):
+        self.src_ip = src_ip
+        self.dst_ip = dst_ip
+        self.proto  = proto
+        self.dport  = dport
+        self.is_syn = is_syn
+
+
+def parse_packet(raw: bytes) -> Packet | None:
+    """
+    Parse a raw frame from AF_PACKET. Returns None for non-IPv4 or too-short.
+    Ethernet (14) + IP (min 20) + transport header minimum.
+    """
+    if len(raw) < 34:   # 14 eth + 20 ip
+        return None
+
+    # Ethernet header: dst(6) src(6) type(2)
+    eth_type = struct.unpack_from("!H", raw, 12)[0]
+    if eth_type != ETH_P_IP:
+        return None
+
+    ip = raw[14:]
+    if len(ip) < 20:
+        return None
+
+    ihl     = (ip[0] & 0x0F) * 4
+    proto   = ip[9]
+    src_ip  = socket.inet_ntoa(ip[12:16])
+    dst_ip  = socket.inet_ntoa(ip[16:20])
+    payload = ip[ihl:]
+
+    dport  = 0
+    is_syn = False
+
+    if proto == PROTO_TCP and len(payload) >= 14:
+        dport  = struct.unpack_from("!H", payload, 2)[0]
+        flags  = payload[13]
+        is_syn = bool(flags & 0x02) and not bool(flags & 0x10)  # SYN without ACK
+
+    elif proto == PROTO_UDP and len(payload) >= 4:
+        dport = struct.unpack_from("!H", payload, 2)[0]
+
+    return Packet(src_ip, dst_ip, proto, dport, is_syn)
+
 
 class PacketBuffer:
-    """Thread-safe packet accumulator fed by the sniffer thread."""
+    """Thread-safe ring buffer for captured packets."""
 
     def __init__(self):
-        self._lock   = threading.Lock()
-        self._buffer = []
+        self._lock = threading.Lock()
+        self._pkts: list[Packet] = []
 
-    def add(self, pkt):
+    def put(self, pkt: Packet):
         with self._lock:
-            self._buffer.append(pkt)
+            self._pkts.append(pkt)
 
-    def drain(self) -> list:
-        """Atomically return all buffered packets and reset the buffer."""
+    def drain(self) -> list[Packet]:
         with self._lock:
-            pkts, self._buffer = self._buffer, []
-        return pkts
+            out, self._pkts = self._pkts, []
+        return out
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FEATURE EXTRACTION
-# ─────────────────────────────────────────────────────────────────────────────
-
-FEATURE_NAMES = [
-    "packet_rate",       # packets / second
-    "tcp_count",         # raw TCP packet count in window
-    "udp_count",
-    "icmp_count",
-    "avg_pkt_size",      # mean IP total-length (bytes)
-    "syn_count",         # TCP SYN flag count (new connection attempts)
-    "unique_src_ips",    # distinct source IPs seen
-    "unique_dst_ports",  # distinct destination ports seen
-]
-
-
-def extract_features(packets: list, window_secs: float) -> np.ndarray:
-    """
-    Derive a feature vector from packets captured in one time window.
-    Returns shape (8,) float64 array.
-    """
-    n = len(packets)
-    if n == 0:
-        return np.zeros(len(FEATURE_NAMES), dtype=float)
-
-    tcp = udp = icmp = syn = 0
-    pkt_sizes  = []
-    src_ips    = set()
-    dst_ports  = set()
-
-    for pkt in packets:
-        if IP not in pkt:
-            continue
-        ip_layer = pkt[IP]
-        pkt_sizes.append(ip_layer.len)
-        src_ips.add(ip_layer.src)
-
-        if TCP in pkt:
-            tcp += 1
-            tcp_layer = pkt[TCP]
-            dst_ports.add(tcp_layer.dport)
-            if tcp_layer.flags & 0x02:   # SYN flag bit
-                syn += 1
-        elif UDP in pkt:
-            udp += 1
-            dst_ports.add(pkt[UDP].dport)
-        elif ICMP in pkt:
-            icmp += 1
-
-    avg_size = float(np.mean(pkt_sizes)) if pkt_sizes else 0.0
-
-    return np.array([
-        n / window_secs,
-        float(tcp),
-        float(udp),
-        float(icmp),
-        avg_size,
-        float(syn),
-        float(len(src_ips)),
-        float(len(dst_ports)),
-    ], dtype=float)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ANOMALY DETECTOR
-# ─────────────────────────────────────────────────────────────────────────────
-
-class AnomalyDetector:
-    """
-    Wraps IsolationForest.  Returns a raw (is_flagged, score) tuple.
-    The IDS layer applies the confirmation + cooldown gates on top.
-    """
-
-    def __init__(self):
-        self._model: IsolationForest | None = None
-        self._lock  = threading.Lock()
-
-    def train(self, X: np.ndarray):
-        model = IsolationForest(
-            n_estimators  = IF_ESTIMATORS,
-            contamination = IF_CONTAMINATION,
-            random_state  = 42,
-            n_jobs        = 1,
-        )
-        model.fit(X)
-        with self._lock:
-            self._model = model
-        log.info("Model trained on %d windows (contamination=%s).",
-                 len(X), IF_CONTAMINATION)
-
-    def score(self, features: np.ndarray) -> tuple[bool, float]:
-        """
-        Returns (model_flagged: bool, decision_score: float).
-        decision_score < 0 → anomaly territory; closer to -1 → more extreme.
-        """
-        with self._lock:
-            if self._model is None:
-                return False, 0.0
-            x     = features.reshape(1, -1)
-            pred  = self._model.predict(x)[0]          # 1 = normal, -1 = anomaly
-            sc    = self._model.decision_function(x)[0]
-        return (pred == -1), float(sc)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SNIFFER THREAD
-# ─────────────────────────────────────────────────────────────────────────────
 
 class Sniffer(threading.Thread):
-    """Daemon thread that feeds raw packets into a PacketBuffer."""
+    """
+    Reads raw frames from an AF_PACKET socket in a daemon thread.
+    Requires root / CAP_NET_RAW.
+    """
 
-    def __init__(self, buffer: PacketBuffer, iface=None):
+    def __init__(self, buf: PacketBuffer, iface: str):
         super().__init__(daemon=True, name="sniffer")
-        self._buf   = buffer
+        self._buf   = buf
         self._iface = iface
         self._stop  = threading.Event()
-        scapy_conf.verb = 0   # silence Scapy's own output
-
-    def _cb(self, pkt):
-        if not self._stop.is_set():
-            self._buf.add(pkt)
+        self._sock  = None
 
     def run(self):
-        log.info("Sniffer started on interface: %s", self._iface or "default")
         try:
-            sniff(
-                iface       = self._iface,
-                prn         = self._cb,
-                store       = False,
-                stop_filter = lambda _: self._stop.is_set(),
+            self._sock = socket.socket(
+                socket.AF_PACKET,
+                socket.SOCK_RAW,
+                socket.htons(ETH_P_ALL)
             )
+            self._sock.bind((self._iface, 0))
+            self._sock.settimeout(1.0)
+            log.info("Sniffer listening on interface: %s", self._iface)
         except PermissionError:
-            log.critical("Packet capture requires root/admin privileges. "
-                         "Re-run with: sudo python ids_main.py")
-            sys.exit(1)
-        except Exception as exc:
-            log.critical("Sniffer crashed: %s", exc, exc_info=True)
-            sys.exit(1)
+            log.critical(
+                "Permission denied. Run with:  sudo python3 ids_main.py"
+            )
+            os._exit(1)
+        except OSError as e:
+            log.critical("Cannot open socket on %s: %s", self._iface, e)
+            os._exit(1)
+
+        while not self._stop.is_set():
+            try:
+                raw = self._sock.recv(65535)
+                pkt = parse_packet(raw)
+                if pkt:
+                    self._buf.put(pkt)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+        if self._sock:
+            self._sock.close()
 
     def stop(self):
         self._stop.set()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# WINDOW STATISTICS
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WindowStats:
+    """Metrics computed from one WINDOW_SECONDS batch of packets."""
+    __slots__ = (
+        "total_rate", "syn_rate", "udp_rate", "icmp_rate",
+        "tcp_count",  "syn_count", "udp_count", "icmp_count",
+        "syn_ratio",
+        "src_port_spread",   # dict: src_ip -> number of distinct dst ports
+    )
+
+    def __init__(self):
+        self.total_rate = 0.0; self.syn_rate  = 0.0
+        self.udp_rate   = 0.0; self.icmp_rate = 0.0
+        self.tcp_count  = 0;   self.syn_count  = 0
+        self.udp_count  = 0;   self.icmp_count = 0
+        self.syn_ratio  = 0.0
+        self.src_port_spread: dict[str, int] = {}
+
+
+def compute_stats(packets: list[Packet], window_secs: float) -> WindowStats:
+    ws  = WindowStats()
+    src_ports: dict[str, set] = collections.defaultdict(set)
+
+    for p in packets:
+        if p.proto == PROTO_TCP:
+            ws.tcp_count += 1
+            src_ports[p.src_ip].add(p.dport)
+            if p.is_syn:
+                ws.syn_count += 1
+        elif p.proto == PROTO_UDP:
+            ws.udp_count += 1
+            src_ports[p.src_ip].add(p.dport)
+        elif p.proto == PROTO_ICMP:
+            ws.icmp_count += 1
+
+    n = len(packets)
+    ws.total_rate = n              / window_secs
+    ws.syn_rate   = ws.syn_count   / window_secs
+    ws.udp_rate   = ws.udp_count   / window_secs
+    ws.icmp_rate  = ws.icmp_count  / window_secs
+    ws.syn_ratio  = ws.syn_count / ws.tcp_count if ws.tcp_count > 0 else 0.0
+    ws.src_port_spread = {ip: len(ports) for ip, ports in src_ports.items()}
+
+    return ws
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN DETECTION LOOP
+# ADAPTIVE BASELINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Baseline:
+    """
+    Collects p99 peaks over BASELINE_SECONDS and sets detection thresholds.
+    Thresholds = max(absolute_floor, p99_peak × THRESHOLD_MULTIPLIER)
+    """
+
+    def __init__(self):
+        self._samples: dict[str, list[float]] = {
+            "total": [], "syn": [], "udp": [], "icmp": []
+        }
+        self.thr_total = TOTAL_FLOOR
+        self.thr_syn   = SYN_FLOOR
+        self.thr_udp   = UDP_FLOOR
+        self.thr_icmp  = ICMP_FLOOR
+
+    def record(self, ws: WindowStats):
+        self._samples["total"].append(ws.total_rate)
+        self._samples["syn"].append(ws.syn_rate)
+        self._samples["udp"].append(ws.udp_rate)
+        self._samples["icmp"].append(ws.icmp_rate)
+
+    @staticmethod
+    def _p99(vals: list) -> float:
+        if not vals:
+            return 0.0
+        s = sorted(vals)
+        return s[max(0, int(len(s) * 0.99) - 1)]
+
+    def finalise(self):
+        p_total = self._p99(self._samples["total"])
+        p_syn   = self._p99(self._samples["syn"])
+        p_udp   = self._p99(self._samples["udp"])
+        p_icmp  = self._p99(self._samples["icmp"])
+
+        self.thr_total = max(TOTAL_FLOOR, p_total * THRESHOLD_MULTIPLIER)
+        self.thr_syn   = max(SYN_FLOOR,   p_syn   * THRESHOLD_MULTIPLIER)
+        self.thr_udp   = max(UDP_FLOOR,   p_udp   * THRESHOLD_MULTIPLIER)
+        self.thr_icmp  = max(ICMP_FLOOR,  p_icmp  * THRESHOLD_MULTIPLIER)
+
+        log.info(
+            "Baseline done. Thresholds →  "
+            "total=%.0f/s  syn=%.0f/s  udp=%.0f/s  icmp=%.0f/s",
+            self.thr_total, self.thr_syn, self.thr_udp, self.thr_icmp,
+        )
+        log.info(
+            "Observed p99 peaks →  "
+            "total=%.1f/s  syn=%.1f/s  udp=%.1f/s  icmp=%.1f/s",
+            p_total, p_syn, p_udp, p_icmp,
+        )
+        write_alert(
+            "IDS entered DETECTION mode",
+            f"thr_total={self.thr_total:.0f}/s "
+            f"thr_syn={self.thr_syn:.0f}/s "
+            f"thr_udp={self.thr_udp:.0f}/s "
+            f"thr_icmp={self.thr_icmp:.0f}/s"
+        )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RULE ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RuleEngine:
+    """
+    Evaluates 5 rules each window. Each rule has its own streak counter
+    and cooldown timer — they are completely independent.
+    """
+
+    def __init__(self, baseline: Baseline):
+        self._b          = baseline
+        self._streak:     dict[str, int]   = collections.defaultdict(int)
+        self._last_alert: dict[str, float] = collections.defaultdict(float)
+
+    def _arm(self, rule: str, kind: str, detail: str):
+        """Increment streak; write alert only when confirmation + cooldown pass."""
+        self._streak[rule] += 1
+        if self._streak[rule] < CONFIRM_WINDOWS:
+            log.debug("[SUSPECT] %-20s  streak=%d/%d",
+                      rule, self._streak[rule], CONFIRM_WINDOWS)
+            return
+        now  = time.monotonic()
+        wait = COOLDOWN_SECS - (now - self._last_alert[rule])
+        if wait > 0:
+            log.debug("[COOLDOWN] %-20s  %.0fs remaining", rule, wait)
+            return
+        self._last_alert[rule] = now
+        self._streak[rule]     = 0
+        write_alert(kind, detail)
+
+    def _clear(self, rule: str):
+        if self._streak[rule]:
+            log.debug("[CLEAR] %-20s  streak reset", rule)
+            self._streak[rule] = 0
+
+    def evaluate(self, ws: WindowStats):
+        b = self._b
+        proto_fired = False
+
+        # ── Rule 1: SYN flood ────────────────────────────────────────────────
+        if ws.syn_rate > b.thr_syn and ws.syn_ratio > SYN_RATIO_MIN:
+            self._arm(
+                "syn_flood", "SYN flood",
+                f"syn={ws.syn_rate:.0f}/s (thr={b.thr_syn:.0f}) "
+                f"ratio={ws.syn_ratio:.0%} tcp={ws.tcp_count} syn={ws.syn_count}"
+            )
+            proto_fired = True
+        else:
+            self._clear("syn_flood")
+
+        # ── Rule 2: UDP flood ────────────────────────────────────────────────
+        if ws.udp_rate > b.thr_udp:
+            self._arm(
+                "udp_flood", "UDP flood",
+                f"udp={ws.udp_rate:.0f}/s (thr={b.thr_udp:.0f}) pkts={ws.udp_count}"
+            )
+            proto_fired = True
+        else:
+            self._clear("udp_flood")
+
+        # ── Rule 3: ICMP flood ───────────────────────────────────────────────
+        if ws.icmp_rate > b.thr_icmp:
+            self._arm(
+                "icmp_flood", "ICMP flood",
+                f"icmp={ws.icmp_rate:.0f}/s (thr={b.thr_icmp:.0f}) pkts={ws.icmp_count}"
+            )
+            proto_fired = True
+        else:
+            self._clear("icmp_flood")
+
+        # ── Rule 4: Volumetric DoS (catch-all, no duplicate) ────────────────
+        if ws.total_rate > b.thr_total and not proto_fired:
+            self._arm(
+                "vol_flood", "Volumetric DoS",
+                f"rate={ws.total_rate:.0f}/s (thr={b.thr_total:.0f}) "
+                f"tcp={ws.tcp_count} udp={ws.udp_count} icmp={ws.icmp_count}"
+            )
+        else:
+            self._clear("vol_flood")
+
+        # ── Rule 5: Port scan ────────────────────────────────────────────────
+        active_scanners: set[str] = set()
+        for ip, spread in ws.src_port_spread.items():
+            if spread >= PORT_SCAN_THRESHOLD:
+                key = f"scan_{ip}"
+                active_scanners.add(key)
+                self._arm(
+                    key, "Port scan",
+                    f"src={ip} ports={spread} (thr={PORT_SCAN_THRESHOLD})"
+                )
+        for key in list(self._streak):
+            if key.startswith("scan_") and key not in active_scanners:
+                self._clear(key)
+
+        log.debug(
+            "[WIN] total=%.0f syn=%.0f(%.0f%%) udp=%.0f icmp=%.0f spread_max=%d",
+            ws.total_rate, ws.syn_rate, ws.syn_ratio * 100,
+            ws.udp_rate, ws.icmp_rate,
+            max(ws.src_port_spread.values()) if ws.src_port_spread else 0,
+        )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IDS MAIN CLASS
 # ─────────────────────────────────────────────────────────────────────────────
 
 class IDS:
     def __init__(self):
-        self._buf      = PacketBuffer()
-        self._sniffer  = Sniffer(self._buf, iface=INTERFACE)
-        self._detector = AnomalyDetector()
+        iface        = get_interface()
+        self._buf    = PacketBuffer()
+        self._sniffer = Sniffer(self._buf, iface)
+        self._baseline = Baseline()
+        self._engine   = None
 
-        self._normal_history: collections.deque = collections.deque(
-            maxlen=NORMAL_HISTORY_SIZE
-        )
-        self._training_vectors: list[np.ndarray] = []
-
-        self._phase            = "training"
-        self._phase_start      = time.monotonic()
-        self._windows_since_rt = 0
-
-        # False-positive gate state
-        self._consecutive_anomalies = 0          # Gate 2 counter
-        self._last_alert_time       = 0.0        # Gate 3 timestamp
-
-        self._total_windows = 0
-        self._total_alerts  = 0
+        self._phase       = "baseline"
+        self._phase_start = time.monotonic()
+        self._windows     = 0
 
         self._running = True
-        signal.signal(signal.SIGTERM, self._handle_signal)
-        signal.signal(signal.SIGINT,  self._handle_signal)
+        signal.signal(signal.SIGTERM, self._stop_signal)
+        signal.signal(signal.SIGINT,  self._stop_signal)
 
-    def _handle_signal(self, sig, _frame):
-        log.info("Shutdown signal (%s) received.", signal.Signals(sig).name)
+    def _stop_signal(self, sig, _):
+        log.info("Signal received — shutting down cleanly.")
         self._running = False
 
-    # ── Training → detection transition ─────────────────────────────────────
-
-    def _enter_detection(self):
-        X = np.array(self._training_vectors)
-        self._detector.train(X)
-        for v in self._training_vectors:
-            self._normal_history.append(v)
-        self._phase = "detecting"
-        log.info("Switched to DETECTION mode (%d training windows).",
-                 len(self._training_vectors))
-        _write_alert(
-            f"IDS entered DETECTION mode — "
-            f"baseline={len(self._training_vectors)} windows, "
-            f"score_threshold={SCORE_THRESHOLD}, "
-            f"confirm_windows={CONFIRM_WINDOWS}, "
-            f"cooldown={ALERT_COOLDOWN_SECS}s"
-        )
-
-    # ── Adaptive re-training on rolling normal history ───────────────────────
-
-    def _maybe_retrain(self):
-        self._windows_since_rt += 1
-        if (self._windows_since_rt >= RETRAIN_EVERY_WINDOWS
-                and len(self._normal_history) >= MIN_TRAIN_SAMPLES):
-            X = np.array(self._normal_history)
-            self._detector.train(X)
-            self._windows_since_rt = 0
-            log.info("Adaptive re-train: %d normal windows in history.",
-                     len(self._normal_history))
-
-    # ── Three-gate alert decision ────────────────────────────────────────────
-
-    def _evaluate(self, features: np.ndarray, packets: list):
-        """
-        Apply the three false-positive suppression gates and fire an alert
-        only when all three pass simultaneously.
-        """
-        model_flagged, score = self._detector.score(features)
-
-        # ── Gate 1: score must be deep enough in anomaly territory ───────────
-        deep_enough = model_flagged and (score <= SCORE_THRESHOLD)
-
-        if deep_enough:
-            self._consecutive_anomalies += 1
-            log.debug("[SUSPECT] streak=%d  score=%.3f  rate=%.1f/s  syn=%d  "
-                      "src_ips=%d  dst_ports=%d",
-                      self._consecutive_anomalies, score,
-                      features[0], int(features[5]),
-                      int(features[6]), int(features[7]))
-        else:
-            # Reset streak — this window looks normal or borderline
-            if self._consecutive_anomalies > 0:
-                log.debug("[CLEARED] streak reset after %d window(s).",
-                          self._consecutive_anomalies)
-            self._consecutive_anomalies = 0
-            # Only add confirmed-normal windows to the history pool
-            self._normal_history.append(features)
-            self._maybe_retrain()
-            return  # not anomalous — done
-
-        # ── Gate 2: must have CONFIRM_WINDOWS consecutive anomalous windows ──
-        if self._consecutive_anomalies < CONFIRM_WINDOWS:
-            return   # anomalous but not yet confirmed
-
-        # ── Gate 3: cooldown — don't repeat-alert within ALERT_COOLDOWN_SECS ─
-        now = time.monotonic()
-        if (now - self._last_alert_time) < ALERT_COOLDOWN_SECS:
-            log.debug("[SUPPRESSED] cooldown active (%.0fs remaining).",
-                      ALERT_COOLDOWN_SECS - (now - self._last_alert_time))
-            return
-
-        # ── All three gates passed → fire alert ──────────────────────────────
-        self._last_alert_time = now
-        self._total_alerts   += 1
-        self._consecutive_anomalies = 0   # reset after firing
-
-        rate  = features[0]
-        tcp   = int(features[1])
-        udp   = int(features[2])
-        icmp  = int(features[3])
-        syn   = int(features[5])
-        ips   = int(features[6])
-        ports = int(features[7])
-
-        # Classify the anomaly type for a more descriptive alert message
-        if syn > 50:
-            kind = "SYN flood / port scan"
-        elif icmp > 100:
-            kind = "ICMP flood"
-        elif rate > 500:
-            kind = "traffic volume spike"
-        elif ips > 30:
-            kind = "distributed scan / botnet"
-        elif ports > 50:
-            kind = "port sweep"
-        else:
-            kind = "statistical anomaly"
-
-        msg = (
-            f"{kind} | score={score:.3f} "
-            f"rate={rate:.0f}pkt/s tcp={tcp} udp={udp} icmp={icmp} "
-            f"syn={syn} src_ips={ips} dst_ports={ports}"
-        )
-        _write_alert(msg)
-
-    # ── Main loop ────────────────────────────────────────────────────────────
-
     def run(self):
-        log.info("IDS starting — training phase (%d s, %d-s windows).",
-                 TRAIN_SECONDS, WINDOW_SECONDS)
-        _write_alert("IDS started — entering training phase.")
+        log.info(
+            "IDS starting  |  baseline=%ds  window=%ds  "
+            "multiplier=%dx  confirm=%d  cooldown=%ds",
+            BASELINE_SECONDS, WINDOW_SECONDS,
+            THRESHOLD_MULTIPLIER, CONFIRM_WINDOWS, COOLDOWN_SECS,
+        )
+        write_alert(
+            "IDS started",
+            f"baseline={BASELINE_SECONDS}s window={WINDOW_SECONDS}s "
+            f"multiplier={THRESHOLD_MULTIPLIER}x"
+        )
         self._sniffer.start()
 
         try:
@@ -483,39 +531,47 @@ class IDS:
                 if not self._running:
                     break
 
-                packets  = self._buf.drain()
-                features = extract_features(packets, WINDOW_SECONDS)
-                self._total_windows += 1
+                pkts = self._buf.drain()
+                ws   = compute_stats(pkts, WINDOW_SECONDS)
+                self._windows += 1
 
-                # ── TRAINING ─────────────────────────────────────────────────
-                if self._phase == "training":
-                    self._training_vectors.append(features)
-                    elapsed = time.monotonic() - self._phase_start
+                # ── BASELINE PHASE ────────────────────────────────────────────
+                if self._phase == "baseline":
+                    self._baseline.record(ws)
+                    elapsed   = time.monotonic() - self._phase_start
+                    remaining = max(0, BASELINE_SECONDS - elapsed)
 
-                    if (elapsed >= TRAIN_SECONDS
-                            and len(self._training_vectors) >= MIN_TRAIN_SAMPLES):
-                        self._enter_detection()
-                    else:
-                        log.debug(
-                            "[TRAIN %3ds/%ds] pkts=%d  rate=%.1f/s  "
-                            "tcp=%d  udp=%d  icmp=%d",
-                            int(elapsed), TRAIN_SECONDS, len(packets),
-                            features[0], int(features[1]),
-                            int(features[2]), int(features[3]),
-                        )
+                    log.info(
+                        "[BASELINE  %3.0fs left]  "
+                        "pkts=%4d  total=%.0f/s  syn=%.0f/s  "
+                        "udp=%.0f/s  icmp=%.0f/s",
+                        remaining, len(pkts),
+                        ws.total_rate, ws.syn_rate,
+                        ws.udp_rate,   ws.icmp_rate,
+                    )
 
-                # ── DETECTION ────────────────────────────────────────────────
+                    if elapsed >= BASELINE_SECONDS:
+                        self._baseline.finalise()
+                        self._engine = RuleEngine(self._baseline)
+                        self._phase  = "detecting"
+                        log.info("Detection ARMED. Monitoring for attacks.")
+
+                # ── DETECTION PHASE ───────────────────────────────────────────
                 else:
-                    self._evaluate(features, packets)
+                    log.info(
+                        "[DETECTING]           "
+                        "pkts=%4d  total=%.0f/s  syn=%.0f/s  "
+                        "udp=%.0f/s  icmp=%.0f/s",
+                        len(pkts),
+                        ws.total_rate, ws.syn_rate,
+                        ws.udp_rate,   ws.icmp_rate,
+                    )
+                    self._engine.evaluate(ws)
 
         finally:
             self._sniffer.stop()
-            log.info("IDS stopped. windows=%d  alerts=%d",
-                     self._total_windows, self._total_alerts)
-            _write_alert(
-                f"IDS stopped. windows={self._total_windows} "
-                f"alerts={self._total_alerts}"
-            )
+            log.info("IDS stopped. Total windows: %d", self._windows)
+            write_alert("IDS stopped", f"windows={self._windows}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
