@@ -1,1 +1,1 @@
-Check instructions for further info on running the IDS
+Check INSTRUCTIONS.md for further info on running the IDS on your KALI
