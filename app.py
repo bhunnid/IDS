@@ -1,9 +1,3 @@
-"""
-app.py  —  IDS Web Control Panel
-Flask dashboard to start/stop ids_main.py and watch live alerts.
-No JS frameworks. Polls /status, /alerts, /metrics every 5 seconds.
-"""
-
 import os
 import re
 import sys
