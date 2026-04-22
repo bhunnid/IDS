@@ -1,7 +1,6 @@
-# Kali Linux IDS — Complete Guide
+# IDS 
 
-A rule-based Network Intrusion Detection System built for Kali Linux.
-Captures live traffic using raw sockets (no Scapy, no external dependencies),
+An Intrusion Detection System 
 learns your normal baseline, then alerts only on real attacks.
 
 ---
@@ -99,7 +98,7 @@ only the IDS engine needs root because it opens a raw socket.
 
 ## Step 3 — Start the IDS
 
-Click **▶ Start IDS** in the browser.
+Click **Start IDS** in the browser.
 
 The dashboard launches `ids_main.py` with `sudo`. The status badge changes to
 **BASELINE...** with an amber pulsing dot. A progress bar shows how far through
