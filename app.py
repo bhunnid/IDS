@@ -1,7 +1,5 @@
 """
 app.py  —  IDS Web Control Panel
-Flask dashboard to start/stop ids_main.py and view live alerts.
-No JavaScript frameworks. Auto-polls every 5 seconds.
 
 Run:  python3 app.py
 Open: http://localhost:5000

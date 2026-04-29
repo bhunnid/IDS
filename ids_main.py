@@ -1,11 +1,5 @@
 """
 ids_main.py  —  Network Intrusion Detection System for Kali Linux
-==================================================================
-No external dependencies.  Uses only Python standard library.
-Requires root / sudo for raw packet capture (AF_PACKET socket).
-
-RUN
-    sudo python3 ids_main.py
 
 HOW IT WORKS
 ------------
