@@ -1,8 +1,12 @@
-Ulinzi: Lightweight Anomaly-Based IDS for Small Networks
+# Ulinzi: Lightweight Anomaly-Based IDS for Small Networks
 
-Ulinzi is a Python-based intrusion detection system that monitors live network traffic, learns a baseline of normal activity and detects anomalies such as floods and port scans in real time.
+Ulinzi is a Python-based intrusion detection system that monitors live network traffic, learns a baseline of normal activity, and detects anomalies such as floods and port scans in real time.
 
-Quick Start
+---
+
+## Quick Start
+
+```bash
 mkdir ~/ids && cd ~/ids
 
 # add ids_main.py and app.py
@@ -11,7 +15,7 @@ pip3 install flask
 
 python3 app.py
 
-Open:
+Open in browser:
 
 http://localhost:5000
 
@@ -29,7 +33,7 @@ Check interface:
 
 ip link show
 
-Check IP:
+Check IP address:
 
 ip addr show | grep "inet " | grep -v 127
 
@@ -40,7 +44,7 @@ Operation
 1. Baseline Phase (Automatic)
 Duration: 60 seconds
 Learns normal traffic rates
-No attacks should be run
+Do not run attacks during this phase
 2. Detection Phase
 Starts automatically after baseline
 System begins monitoring for anomalies
@@ -60,7 +64,7 @@ Volumetric DoS
 sudo hping3 --flood <your-ip>
 Detection Timing
 Requires 2 consecutive windows (~6 seconds)
-Dashboard refresh: ~5 seconds
+Dashboard refresh interval: ~5 seconds
 Expected alert delay: 6–11 seconds
 Logs
 Alerts
@@ -89,23 +93,15 @@ sudo python3 ids_main.py
 Stopping
 sudo kill $(pgrep -f ids_main.py)
 Common Issues
-
 Permission denied
-
 sudo python3 ids_main.py
-
 No packets captured
-
 Wrong interface → set INTERFACE manually
-
 Wrong phase / stuck state
-
 rm ~/ids/alerts.log
-
 Port already in use
-
 PORT=8080 python3 app.py
 Notes
 Designed for small networks and lab environments
-Uses statistical anomaly detection (no ML)
+Uses statistical anomaly detection (no machine learning)
 Focused on low overhead and simplicity
