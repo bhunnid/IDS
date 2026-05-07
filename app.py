@@ -1,117 +1,84 @@
 """
-app.py  —  Ulinzi HIDS Web Control Panel
-
-Run:  python3 app.py
+app.py  —  Ulinzi HIDS  ·  Web Dashboard + Engine Launcher
+============================================================
+Run:  sudo python3 app.py
 Open: http://localhost:5000
 
-The HIDS engine (hids_main.py) is launched with sudo so it can open a raw
-packet socket and read system auth logs.  The panel itself does not need root.
+sudo is required so the engine can open an AF_PACKET raw socket and read
+/var/log/auth.log.  The Flask dashboard itself is lightweight.
+
+The HIDS engine starts automatically in the background the moment this
+script launches.  No second terminal is needed.
 """
 
-import os
-import re
-import sys
-import time
-import threading
-import subprocess
-import collections
+import os, re, sys, threading, signal
 from datetime import datetime
 from flask import Flask, render_template_string, jsonify, request
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────────────────────────────────────
-HIDS_SCRIPT        = os.environ.get("HIDS_SCRIPT",  "hids_main.py")
-ALERT_LOG          = os.environ.get("ALERT_LOG",    "alerts.log")
-HIDS_BASELINE_SECS = int(os.environ.get("HIDS_BASELINE_SECS", 60))
-HOST               = os.environ.get("HOST", "0.0.0.0")
-PORT               = int(os.environ.get("PORT", 5000))
+# ── import engine ─────────────────────────────────────────────────────────────
+import hids_main as engine_mod
+
+ALERT_LOG = engine_mod.ALERT_LOG
+PORT      = int(os.environ.get("PORT", 5000))
+HOST_BIND = os.environ.get("HOST", "0.0.0.0")
 
 app = Flask(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Process state  (all reads/writes under _lock)
-# ─────────────────────────────────────────────────────────────────────────────
-_lock        = threading.Lock()
-_proc        = None
-_start_time  = None
-_stop_reason = "Not started yet"
+# =============================================================================
+# AUTO-START ENGINE
+# =============================================================================
 
+def _launch_engine():
+    engine_mod.start_engine()
 
-def _running() -> bool:
-    with _lock:
-        return _proc is not None and _proc.poll() is None
+_launch_thread = threading.Thread(target=_launch_engine, daemon=True)
+_launch_thread.start()
 
+# Graceful shutdown
+def _on_exit(*_):
+    engine_mod.stop_engine()
+    os._exit(0)
 
-def _watcher(proc: subprocess.Popen) -> None:
-    global _proc, _stop_reason
-    proc.wait()
-    with _lock:
-        if _proc is proc:
-            _stop_reason = "Exited (code %d)" % proc.returncode
-            _proc = None
+signal.signal(signal.SIGTERM, _on_exit)
+signal.signal(signal.SIGINT,  _on_exit)
 
+# =============================================================================
+# ALERT PARSING
+# =============================================================================
 
-def _uptime() -> str:
-    with _lock:
-        st = _start_time
-    if st and _running():
-        s = int((datetime.now() - st).total_seconds())
-        h, r = divmod(s, 3600)
-        m, sec = divmod(r, 60)
-        return "%02d:%02d:%02d" % (h, m, sec)
-    return ""
+# Format: [YYYY-MM-DD HH:MM:SS] LEVEL:<level> RULE:<rule> | <detail>
+_RE = re.compile(
+    r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+LEVEL:(\w+)\s+RULE:(\S+)\s+\|\s+(.*)$'
+)
 
+_RULE_META = {
+    # rule_tag           : (label,              icon, css-color-class)
+    "brute_force":         ("Brute-force",       "🔑", "c-red"),
+    "priv_escalation":     ("Priv. Escalation",  "⬆",  "c-red"),
+    "proc_anomaly":        ("Process Anomaly",   "⚙",  "c-orange"),
+    "file_integrity":      ("File Tampered",     "📄", "c-red"),
+    "syn_flood":           ("SYN Flood",         "🌊", "c-red"),
+    "udp_flood":           ("UDP Flood",         "🌊", "c-orange"),
+    "icmp_flood":          ("ICMP Flood",        "🌊", "c-orange"),
+    "udp_flood":           ("UDP Flood",         "🌊", "c-orange"),
+    "vol_flood":           ("Vol. DoS",          "💥", "c-red"),
+    "engine":              ("System",            "ℹ",  "c-blue"),
+}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase detection
-# ─────────────────────────────────────────────────────────────────────────────
+_LEVEL_COLOR = {
+    "CRITICAL": "#ff3d57",
+    "HIGH":     "#ff6b35",
+    "MEDIUM":   "#f59e0b",
+    "LOW":      "#38b2ff",
+    "INFO":     "#4a6a85",
+}
 
-def _phase_from_log() -> str:
-    if not _running():
-        return "stopped"
-    if not os.path.exists(ALERT_LOG):
-        return "baseline"
-    try:
-        with open(ALERT_LOG, errors="replace") as fh:
-            content = fh.read()
-    except OSError:
-        return "baseline"
-    if "DETECTION mode" in content:
-        return "detecting"
-    return "baseline"
-
-
-def _baseline_pct() -> float:
-    if _phase_from_log() != "baseline":
-        return 1.0
-    with _lock:
-        st = _start_time
-    if st is None:
-        return 0.0
-    elapsed = (datetime.now() - st).total_seconds()
-    return min(elapsed / HIDS_BASELINE_SECS, 0.99)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Alert parsing — covers all HIDS alert kinds (host + network)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_RE = re.compile(r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+ALERT:\s+(.+)$')
-
-_KINDS = {
-    "Brute-force":              ("critical", "Brute-force",      "#ff4560"),
-    "Privilege escalation":     ("critical", "Priv. Escalation", "#ff4560"),
-    "Suspicious process":       ("high",     "Proc. Anomaly",    "#ff6b35"),
-    "File integrity violation": ("critical", "File Tampered",    "#ff4560"),
-    "SYN flood":                ("critical", "SYN Flood",        "#ff4560"),
-    "UDP flood":                ("critical", "UDP Flood",        "#ff4560"),
-    "ICMP flood":               ("critical", "ICMP Flood",       "#ff4560"),
-    "Volumetric DoS":           ("critical", "Vol. DoS",         "#ff4560"),
-    "Port scan":                ("high",     "Port Scan",        "#ffb300"),
-    "HIDS started":             ("info",     "Started",          "#4a6a85"),
-    "DETECTION mode":           ("info",     "Armed",            "#4a6a85"),
-    "HIDS stopped":             ("info",     "Stopped",          "#4a6a85"),
+_LEVEL_BG = {
+    "CRITICAL": "rgba(255,61,87,.08)",
+    "HIGH":     "rgba(255,107,53,.08)",
+    "MEDIUM":   "rgba(245,158,11,.08)",
+    "LOW":      "rgba(56,178,255,.08)",
+    "INFO":     "rgba(74,106,133,.06)",
 }
 
 
@@ -119,23 +86,31 @@ def _parse(raw: str):
     m = _RE.match(raw.strip())
     if not m:
         return None
-    ts, body = m.group(1), m.group(2)
-    kind_str = body.split(" | ")[0] if " | " in body else body
-    detail   = body.split(" | ", 1)[1] if " | " in body else ""
+    ts, level, rule, detail = m.group(1), m.group(2), m.group(3), m.group(4)
 
-    sev, label, color = "medium", "Alert", "#b060ff"
-    for key, (s, l, c) in _KINDS.items():
-        if key.lower() in kind_str.lower():
-            sev, label, color = s, l, c
-            break
+    # strip scan_ prefix for display
+    display_rule = rule[5:] if rule.startswith("scan_") else rule
+    meta = _RULE_META.get(display_rule, ("Alert", "⚠", "c-red"))
+    # port scan label includes the IP
+    if rule.startswith("scan_"):
+        label = f"Port Scan ({rule[5:]})"
+        icon  = "🔍"
+    else:
+        label, icon, _ = meta
 
     return {
-        "ts": ts, "body": body, "kind": kind_str,
-        "severity": sev, "label": label, "color": color, "detail": detail,
+        "ts":     ts,
+        "level":  level,
+        "rule":   rule,
+        "label":  label,
+        "icon":   icon,
+        "detail": detail,
+        "color":  _LEVEL_COLOR.get(level, "#888"),
+        "bg":     _LEVEL_BG.get(level, "rgba(100,100,100,.06)"),
     }
 
 
-def _read_alerts(n: int = 100):
+def _read_alerts(n: int = 120):
     if not os.path.exists(ALERT_LOG):
         return []
     try:
@@ -154,21 +129,42 @@ def _read_alerts(n: int = 100):
 
 
 def _counts():
-    c = {"critical": 0, "high": 0, "medium": 0, "info": 0}
+    c = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
     if not os.path.exists(ALERT_LOG):
         return c
     try:
         with open(ALERT_LOG, errors="replace") as fh:
             for line in fh:
                 a = _parse(line)
-                if a and a["severity"] in c:
-                    c[a["severity"]] += 1
+                if a and a["level"] in c:
+                    c[a["level"]] += 1
     except OSError:
         pass
     return c
 
 
-def _spark(buckets: int = 24, mins: int = 5):
+def _category_counts():
+    host_rules    = {"brute_force","priv_escalation","proc_anomaly","file_integrity"}
+    network_rules = {"syn_flood","udp_flood","icmp_flood","vol_flood"}
+    h = n = 0
+    if not os.path.exists(ALERT_LOG):
+        return {"host": 0, "network": 0}
+    try:
+        with open(ALERT_LOG, errors="replace") as fh:
+            for line in fh:
+                a = _parse(line)
+                if not a or a["level"] == "INFO":
+                    continue
+                r = a["rule"]
+                if r in host_rules:           h += 1
+                elif r in network_rules:      n += 1
+                elif r.startswith("scan_"):   n += 1
+    except OSError:
+        pass
+    return {"host": h, "network": n}
+
+
+def _spark(buckets: int = 30, secs_per_bucket: int = 60):
     result = [0] * buckets
     if not os.path.exists(ALERT_LOG):
         return result
@@ -177,11 +173,11 @@ def _spark(buckets: int = 24, mins: int = 5):
         with open(ALERT_LOG, errors="replace") as fh:
             for line in fh:
                 a = _parse(line)
-                if not a or a["severity"] == "info":
+                if not a or a["level"] == "INFO":
                     continue
                 try:
                     ts  = datetime.strptime(a["ts"], "%Y-%m-%d %H:%M:%S")
-                    idx = int((now - ts).total_seconds() / 60 / mins)
+                    idx = int((now - ts).total_seconds() / secs_per_bucket)
                     if 0 <= idx < buckets:
                         result[idx] += 1
                 except ValueError:
@@ -191,32 +187,18 @@ def _spark(buckets: int = 24, mins: int = 5):
     return list(reversed(result))
 
 
-def _alert_category_counts():
-    host_cats    = {"brute-force", "privilege escalation", "suspicious process",
-                    "file integrity violation"}
-    network_cats = {"syn flood", "udp flood", "icmp flood", "volumetric dos", "port scan"}
-    host_total = net_total = 0
-    if not os.path.exists(ALERT_LOG):
-        return {"host": 0, "network": 0}
-    try:
-        with open(ALERT_LOG, errors="replace") as fh:
-            for line in fh:
-                a = _parse(line)
-                if not a or a["severity"] == "info":
-                    continue
-                k = a["kind"].lower()
-                if any(h in k for h in host_cats):
-                    host_total += 1
-                elif any(n in k for n in network_cats):
-                    net_total += 1
-    except OSError:
-        pass
-    return {"host": host_total, "network": net_total}
+def _uptime() -> str:
+    st = engine_mod.hids_state.get("uptime_start")
+    if st and engine_mod.is_running():
+        s = int((datetime.now() - st).total_seconds())
+        h, r = divmod(s, 3600)
+        m, sec = divmod(r, 60)
+        return f"{h:02d}:{m:02d}:{sec:02d}"
+    return ""
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HTML Template
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# HTML TEMPLATE
+# =============================================================================
 
 TMPL = r"""<!DOCTYPE html>
 <html lang="en">
@@ -228,176 +210,310 @@ TMPL = r"""<!DOCTYPE html>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#06090d;--bg2:#0b1017;--surf:#0f1923;--brd:#1a2535;--brd2:#243040;
-  --txt:#b8cfe0;--mut:#3a5570;--dim:#1e3045;
-  --grn:#00d48a;--red:#ff3d57;--amb:#f59e0b;--blu:#38b2ff;--vio:#a855f7;--org:#ff6b35;
+  --bg:#060a0f;--bg2:#0b1219;--surf:#0f1b26;--brd:#1b2d40;--brd2:#253d55;
+  --txt:#c0d4e8;--mut:#3d5c75;--dim:#1c3045;
+  --grn:#00d48a;--red:#ff3d57;--org:#ff6b35;--amb:#f59e0b;
+  --blu:#38b2ff;--vio:#a855f7;--cyn:#22d3ee;
   --font:'IBM Plex Mono',monospace;--ui:'IBM Plex Sans',sans-serif;
 }
-html,body{height:100%;background:var(--bg);color:var(--txt);font-family:var(--ui)}
-body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.06) 3px,rgba(0,0,0,.06) 4px);pointer-events:none;z-index:9999}
-.wrap{max-width:1200px;margin:0 auto;padding:1.5rem 1rem 4rem;display:grid;gap:1.1rem}
-.hdr{display:flex;justify-content:space-between;align-items:center;padding-bottom:1rem;border-bottom:1px solid var(--brd)}
-.logo{font-family:var(--font);font-size:1rem;color:var(--blu);letter-spacing:.15em;display:flex;align-items:center;gap:.6rem}
-.logo-sub{font-size:.6rem;color:var(--mut);letter-spacing:.08em;margin-top:.2rem}
-.logo-ring{width:10px;height:10px;border-radius:50%;border:2px solid var(--blu);box-shadow:0 0 10px var(--blu);animation:glow 2s ease-in-out infinite}
-@keyframes glow{0%,100%{box-shadow:0 0 4px var(--blu)}50%{box-shadow:0 0 18px var(--blu),0 0 35px rgba(56,178,255,.3)}}
-.hdr-right{font-family:var(--font);font-size:.72rem;color:var(--mut);text-align:right;line-height:1.7}
+html,body{height:100%;background:var(--bg);color:var(--txt);font-family:var(--ui);font-size:14px}
+body::before{content:'';position:fixed;inset:0;
+  background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.04) 2px,rgba(0,0,0,.04) 3px);
+  pointer-events:none;z-index:9998}
+
+/* ── layout ── */
+.wrap{max-width:1280px;margin:0 auto;padding:1.2rem 1rem 3rem;display:grid;gap:1rem}
+.hdr{display:flex;justify-content:space-between;align-items:flex-start;
+     padding-bottom:.9rem;border-bottom:1px solid var(--brd)}
+.brand{display:flex;align-items:center;gap:.7rem}
+.ring{width:11px;height:11px;border-radius:50%;border:2px solid var(--blu);
+      box-shadow:0 0 10px var(--blu);animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 4px var(--blu)}50%{box-shadow:0 0 20px var(--blu),0 0 40px rgba(56,178,255,.25)}}
+.brand-title{font-family:var(--font);font-size:.95rem;color:var(--blu);letter-spacing:.15em}
+.brand-sub{font-size:.6rem;color:var(--mut);letter-spacing:.08em;margin-top:.15rem}
+.hdr-r{font-family:var(--font);font-size:.7rem;color:var(--mut);text-align:right;line-height:1.8}
 #clock{color:var(--txt)}
-.pills{display:grid;grid-template-columns:repeat(4,1fr) 1fr 1fr 200px;gap:.8rem;align-items:stretch}
-.pill{background:var(--surf);border:1px solid var(--brd);border-radius:6px;padding:.6rem .9rem}
-.pill-label{font-family:var(--font);font-size:.6rem;letter-spacing:.12em;text-transform:uppercase;color:var(--mut);margin-bottom:.2rem}
-.pill-val{font-size:1.6rem;font-weight:600;line-height:1}
-.crit{color:var(--red)}.high{color:var(--amb)}.med{color:var(--vio)}.info-c{color:var(--mut)}
-.host-c{color:var(--org)}.net-c{color:var(--blu)}
-.spark-wrap{background:var(--surf);border:1px solid var(--brd);border-radius:6px;padding:.6rem .9rem}
-#spark{display:block;width:100%;height:42px;margin-top:.3rem}
-.main{display:grid;grid-template-columns:290px 1fr;gap:1.1rem;align-items:start}
-.card{background:var(--surf);border:1px solid var(--brd);border-radius:6px;overflow:hidden}
-.card-hdr{padding:.6rem 1rem;border-bottom:1px solid var(--brd);font-family:var(--font);font-size:.6rem;letter-spacing:.14em;text-transform:uppercase;color:var(--mut);display:flex;justify-content:space-between;align-items:center}
-.card-body{padding:1rem}
-.badge{display:flex;align-items:center;gap:.5rem;padding:.4rem .8rem;border-radius:4px;font-family:var(--font);font-size:.75rem;letter-spacing:.06em;text-transform:uppercase;border:1px solid;margin-bottom:.9rem;justify-content:center}
+
+/* ── top stat strip ── */
+.strip{display:grid;grid-template-columns:repeat(5,1fr) 1fr 1fr 1fr 220px;gap:.7rem}
+.pill{background:var(--surf);border:1px solid var(--brd);border-radius:7px;padding:.55rem .8rem;position:relative;overflow:hidden}
+.pill::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
+.pill-crit::before{background:var(--red)}
+.pill-high::before{background:var(--org)}
+.pill-med::before{background:var(--amb)}
+.pill-low::before{background:var(--blu)}
+.pill-info::before{background:var(--mut)}
+.pill-host::before{background:var(--org)}
+.pill-net::before{background:var(--cyn)}
+.pill-win::before{background:var(--vio)}
+.pill-lbl{font-family:var(--font);font-size:.56rem;letter-spacing:.12em;text-transform:uppercase;color:var(--mut);margin-bottom:.18rem}
+.pill-val{font-size:1.65rem;font-weight:600;line-height:1}
+.v-crit{color:var(--red)}.v-high{color:var(--org)}.v-med{color:var(--amb)}
+.v-low{color:var(--blu)}.v-info{color:var(--mut)}.v-host{color:var(--org)}
+.v-net{color:var(--cyn)}.v-win{color:var(--vio)}
+.spark-pill{background:var(--surf);border:1px solid var(--brd);border-radius:7px;padding:.55rem .8rem}
+#spark{display:block;width:100%;height:44px;margin-top:.25rem}
+
+/* ── main 2-col grid ── */
+.main{display:grid;grid-template-columns:280px 1fr;gap:1rem;align-items:start}
+.card{background:var(--surf);border:1px solid var(--brd);border-radius:7px;overflow:hidden}
+.card-hdr{padding:.55rem .9rem;border-bottom:1px solid var(--brd);
+          font-family:var(--font);font-size:.58rem;letter-spacing:.14em;
+          text-transform:uppercase;color:var(--mut);
+          display:flex;justify-content:space-between;align-items:center}
+.card-body{padding:.9rem}
+
+/* ── phase badge ── */
+.badge{display:flex;align-items:center;gap:.45rem;padding:.38rem .7rem;border-radius:4px;
+       font-family:var(--font);font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;
+       border:1px solid;margin-bottom:.8rem;justify-content:center}
 .badge-stopped  {background:rgba(255,61,87,.07);color:var(--red);border-color:rgba(255,61,87,.3)}
 .badge-baseline {background:rgba(245,158,11,.07);color:var(--amb);border-color:rgba(245,158,11,.3)}
 .badge-detecting{background:rgba(0,212,138,.07);color:var(--grn);border-color:rgba(0,212,138,.3)}
 .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
-.dot-stopped{background:var(--red)}
-.dot-baseline{background:var(--amb);animation:blink .8s step-end infinite}
-.dot-detecting{background:var(--grn);box-shadow:0 0 7px var(--grn)}
+.dot-stopped  {background:var(--red)}
+.dot-baseline {background:var(--amb);animation:blink .7s step-end infinite}
+.dot-detecting{background:var(--grn);box-shadow:0 0 8px var(--grn)}
 @keyframes blink{50%{opacity:0}}
-.prog-wrap{margin-bottom:.9rem}
-.prog-hidden{display:none}
-.prog-labels{display:flex;justify-content:space-between;font-family:var(--font);font-size:.65rem;color:var(--mut);margin-bottom:.25rem}
-.prog-track{height:4px;background:var(--dim);border-radius:2px;overflow:hidden}
-.prog-bar{height:100%;background:linear-gradient(90deg,var(--amb),var(--blu));border-radius:2px;transition:width .8s}
-.mon-grid{display:grid;grid-template-columns:1fr 1fr;gap:.4rem;margin-bottom:.9rem}
-.mon-pill{background:var(--bg2);border:1px solid var(--brd);border-radius:4px;padding:.3rem .5rem;font-family:var(--font);font-size:.62rem}
-.mon-label{color:var(--mut);margin-bottom:.1rem}
-.mon-val{display:flex;align-items:center;gap:.3rem}
-.mon-dot{width:5px;height:5px;border-radius:50%;flex-shrink:0}
+
+/* ── baseline progress ── */
+.prog-wrap{margin-bottom:.8rem}
+.prog-hidden{display:none!important}
+.prog-labels{display:flex;justify-content:space-between;
+             font-family:var(--font);font-size:.62rem;color:var(--mut);margin-bottom:.22rem}
+.prog-track{height:5px;background:var(--dim);border-radius:3px;overflow:hidden}
+.prog-bar{height:100%;background:linear-gradient(90deg,var(--amb),var(--blu));
+          border-radius:3px;transition:width .6s ease}
+
+/* ── monitor grid ── */
+.mon-grid{display:grid;grid-template-columns:1fr 1fr;gap:.35rem;margin-bottom:.8rem}
+.mon-pill{background:var(--bg2);border:1px solid var(--brd);border-radius:4px;padding:.28rem .5rem;
+          font-family:var(--font);font-size:.6rem}
+.mon-lbl{color:var(--mut);margin-bottom:.08rem;font-size:.56rem;letter-spacing:.06em;text-transform:uppercase}
+.mon-val{display:flex;align-items:center;gap:.28rem}
+.mdot{width:5px;height:5px;border-radius:50%;flex-shrink:0}
 .mon-on{background:var(--grn)}.mon-off{background:var(--red)}
-.meta{width:100%;border-collapse:collapse;font-family:var(--font);font-size:.7rem;margin-bottom:.9rem}
-.meta td{padding:.3rem 0;border-bottom:1px solid var(--brd)}
-.meta td:first-child{color:var(--mut);width:45%}
+
+/* ── meta table ── */
+.meta{width:100%;border-collapse:collapse;font-family:var(--font);font-size:.68rem;margin-bottom:.8rem}
+.meta td{padding:.28rem 0;border-bottom:1px solid var(--brd)}
+.meta td:first-child{color:var(--mut);width:44%}
 .meta td:last-child{color:var(--txt);text-align:right}
-.btns{display:flex;flex-direction:column;gap:.6rem}
-.btn{width:100%;padding:.55rem;border:1px solid;border-radius:4px;font-family:var(--ui);font-size:.85rem;font-weight:600;letter-spacing:.05em;text-transform:uppercase;cursor:pointer;transition:opacity .12s,box-shadow .12s}
-.btn:disabled{opacity:.25;cursor:not-allowed}
-.btn:not(:disabled):hover{opacity:.8}
-.btn-start{background:rgba(0,212,138,.08);color:var(--grn);border-color:rgba(0,212,138,.4)}
-.btn-start:not(:disabled):hover{box-shadow:0 0 14px rgba(0,212,138,.2)}
-.btn-stop{background:rgba(255,61,87,.08);color:var(--red);border-color:rgba(255,61,87,.4)}
-.btn-stop:not(:disabled):hover{box-shadow:0 0 14px rgba(255,61,87,.2)}
-.btn-clear{background:transparent;color:var(--mut);border-color:var(--brd);font-size:.75rem}
-.flash{margin-top:.7rem;padding:.4rem .6rem;border-radius:4px;font-family:var(--font);font-size:.7rem;border:1px solid}
-.flash-ok{color:var(--grn);background:rgba(0,212,138,.07);border-color:rgba(0,212,138,.3)}
+
+/* ── live traffic bar ── */
+.traffic-bar-wrap{margin-bottom:.8rem}
+.traffic-lbl{font-family:var(--font);font-size:.58rem;letter-spacing:.1em;text-transform:uppercase;color:var(--mut);margin-bottom:.3rem}
+.traffic-bars{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:.25rem}
+.tbar{background:var(--dim);border-radius:3px;overflow:hidden;height:4px;position:relative}
+.tbar-fill{height:100%;border-radius:3px;transition:width .4s ease}
+.tbar-label{display:flex;justify-content:space-between;font-family:var(--font);font-size:.55rem;color:var(--mut);margin-top:.1rem}
+
+/* ── buttons ── */
+.btns{display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-bottom:.5rem}
+.btn-clear-wrap{margin-top:.1rem}
+.btn{width:100%;padding:.5rem;border:1px solid;border-radius:4px;
+     font-family:var(--ui);font-size:.8rem;font-weight:600;
+     letter-spacing:.04em;text-transform:uppercase;cursor:pointer;
+     transition:opacity .12s,box-shadow .12s;background:none}
+.btn:disabled{opacity:.22;cursor:not-allowed}
+.btn-start{color:var(--grn);border-color:rgba(0,212,138,.4);background:rgba(0,212,138,.06)}
+.btn-start:not(:disabled):hover{box-shadow:0 0 16px rgba(0,212,138,.2)}
+.btn-stop {color:var(--red);border-color:rgba(255,61,87,.4);background:rgba(255,61,87,.06)}
+.btn-stop:not(:disabled):hover{box-shadow:0 0 16px rgba(255,61,87,.2)}
+.btn-clear{width:100%;color:var(--mut);border-color:var(--brd);font-size:.72rem;padding:.4rem}
+.flash{margin-top:.6rem;padding:.35rem .55rem;border-radius:4px;
+       font-family:var(--font);font-size:.68rem;border:1px solid}
+.flash-ok {color:var(--grn);background:rgba(0,212,138,.07);border-color:rgba(0,212,138,.3)}
 .flash-err{color:var(--red);background:rgba(255,61,87,.07);border-color:rgba(255,61,87,.3)}
-.feed-hdr-inner{display:flex;justify-content:space-between;align-items:center}
-.feed-controls{display:flex;align-items:center;gap:.6rem}
-.live-dot{width:6px;height:6px;border-radius:50%;background:var(--grn);box-shadow:0 0 5px var(--grn);animation:blink .9s step-end infinite}
+
+/* ── alert feed ── */
+.feed-hdr{display:flex;justify-content:space-between;align-items:center}
+.feed-left{display:flex;align-items:center;gap:.55rem}
+.live-dot{width:6px;height:6px;border-radius:50%;background:var(--grn);
+          box-shadow:0 0 6px var(--grn);animation:blink .9s step-end infinite}
 .live-dot.paused{background:var(--mut);box-shadow:none;animation:none}
-.feed-count{font-family:var(--font);font-size:.65rem;color:var(--mut)}
-.fbtn{background:none;border:1px solid var(--brd);border-radius:3px;color:var(--mut);font-family:var(--font);font-size:.65rem;padding:.15rem .5rem;cursor:pointer}
+.feed-count{font-family:var(--font);font-size:.63rem;color:var(--mut)}
+.fbtn{background:none;border:1px solid var(--brd);border-radius:3px;
+      color:var(--mut);font-family:var(--font);font-size:.63rem;
+      padding:.12rem .44rem;cursor:pointer}
 .fbtn:hover{color:var(--txt);border-color:var(--brd2)}
-.filters{display:flex;gap:.3rem;flex-wrap:wrap}
-.ftab{background:none;border:1px solid var(--brd);border-radius:3px;color:var(--mut);font-family:var(--font);font-size:.62rem;padding:.15rem .45rem;cursor:pointer;text-transform:uppercase;letter-spacing:.05em}
-.ftab.on{background:var(--brd2);color:var(--txt);border-color:var(--brd2)}
-.feed-list{max-height:calc(100vh - 300px);min-height:280px;overflow-y:auto;padding:.4rem;scrollbar-width:thin;scrollbar-color:var(--brd) transparent}
-.feed-list::-webkit-scrollbar{width:4px}
-.feed-list::-webkit-scrollbar-thumb{background:var(--brd);border-radius:2px}
-.acard{display:grid;grid-template-columns:28px 1fr auto;gap:.5rem;align-items:start;padding:.6rem .7rem;border-radius:4px;border:1px solid var(--brd);border-left:3px solid;margin-bottom:.4rem;background:var(--bg2);animation:fadein .2s ease;font-family:var(--font);font-size:.7rem}
-@keyframes fadein{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+.filters{display:flex;gap:.28rem;flex-wrap:wrap}
+.ftab{background:none;border:1px solid var(--brd);border-radius:3px;
+      color:var(--mut);font-family:var(--font);font-size:.6rem;
+      padding:.12rem .4rem;cursor:pointer;text-transform:uppercase;letter-spacing:.05em}
+.ftab.on{color:var(--txt);border-color:var(--brd2);background:var(--brd)}
+
+/* ── alert cards ── */
+.feed{max-height:calc(100vh - 260px);min-height:320px;overflow-y:auto;
+      padding:.35rem;scrollbar-width:thin;scrollbar-color:var(--brd) transparent}
+.feed::-webkit-scrollbar{width:3px}
+.feed::-webkit-scrollbar-thumb{background:var(--brd);border-radius:2px}
+
+.acard{display:grid;grid-template-columns:32px 1fr auto;gap:.45rem;align-items:start;
+       padding:.55rem .65rem;border-radius:5px;border:1px solid var(--brd);
+       border-left:3px solid;margin-bottom:.35rem;animation:fadein .18s ease;
+       font-family:var(--font);font-size:.68rem;transition:border-color .15s}
+@keyframes fadein{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:none}}
 .acard:hover{border-color:var(--brd2)}
-.ac-icon{font-size:1rem;line-height:1;padding-top:.05rem}
-.ac-kind{font-size:.68rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;margin-bottom:.18rem}
-.ac-detail{color:var(--mut);font-size:.65rem;line-height:1.5;word-break:break-all}
-.ac-ts{color:var(--dim);font-size:.62rem;white-space:nowrap;text-align:right}
-.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;height:200px;color:var(--dim);font-family:var(--font);font-size:.75rem;gap:.4rem}
-.empty-icon{font-size:2rem;opacity:.3}
-@media(max-width:900px){.main{grid-template-columns:1fr}.pills{grid-template-columns:repeat(3,1fr)}}
-@media(max-width:600px){.pills{grid-template-columns:1fr 1fr}}
+.ac-icon{font-size:1rem;line-height:1.2;text-align:center}
+.ac-top{display:flex;align-items:center;gap:.4rem;margin-bottom:.12rem;flex-wrap:wrap}
+.ac-level{font-size:.58rem;font-weight:700;letter-spacing:.1em;padding:.05rem .3rem;
+          border-radius:2px;text-transform:uppercase}
+.ac-label{font-size:.68rem;font-weight:600;letter-spacing:.05em;text-transform:uppercase}
+.ac-detail{color:var(--mut);font-size:.63rem;line-height:1.55;word-break:break-all}
+.ac-ts{color:var(--dim);font-size:.6rem;white-space:nowrap;text-align:right;padding-top:.1rem}
+
+.level-CRITICAL{background:rgba(255,61,87,.15);color:#ff3d57}
+.level-HIGH    {background:rgba(255,107,53,.15);color:#ff6b35}
+.level-MEDIUM  {background:rgba(245,158,11,.15);color:#f59e0b}
+.level-LOW     {background:rgba(56,178,255,.15);color:#38b2ff}
+.level-INFO    {background:rgba(74,106,133,.15);color:#4a6a85}
+
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;
+       height:220px;color:var(--dim);font-family:var(--font);font-size:.72rem;gap:.4rem}
+.empty-icon{font-size:2.2rem;opacity:.25}
+
+@media(max-width:1000px){.main{grid-template-columns:1fr}.strip{grid-template-columns:repeat(4,1fr)}}
+@media(max-width:600px) {.strip{grid-template-columns:repeat(2,1fr)}}
 </style>
 </head>
 <body>
 <div class="wrap">
 
+<!-- ── HEADER ── -->
 <header class="hdr">
-  <div>
-    <div class="logo"><div class="logo-ring"></div>ULINZI HIDS CONSOLE</div>
-    <div class="logo-sub">HOST INTRUSION DETECTION SYSTEM</div>
+  <div class="brand">
+    <div class="ring"></div>
+    <div>
+      <div class="brand-title">ULINZI HIDS</div>
+      <div class="brand-sub">HOST INTRUSION DETECTION SYSTEM · KALI LINUX</div>
+    </div>
   </div>
-  <div class="hdr-right"><div id="clock"></div><div>{{ alert_log }}</div></div>
+  <div class="hdr-r">
+    <div id="clock"></div>
+    <div>{{ alert_log }}</div>
+    <div id="hdr-phase" style="color:var(--amb)">{{ phase_label }}</div>
+  </div>
 </header>
 
-<div class="pills">
-  <div class="pill"><div class="pill-label">Critical</div><div class="pill-val crit"   id="cnt-critical">{{ counts.critical }}</div></div>
-  <div class="pill"><div class="pill-label">High</div>    <div class="pill-val high"   id="cnt-high">{{ counts.high }}</div></div>
-  <div class="pill"><div class="pill-label">Medium</div>  <div class="pill-val med"    id="cnt-medium">{{ counts.medium }}</div></div>
-  <div class="pill"><div class="pill-label">Info</div>    <div class="pill-val info-c" id="cnt-info">{{ counts.info }}</div></div>
-  <div class="pill"><div class="pill-label">Host alerts</div><div class="pill-val host-c" id="cnt-host">{{ cat.host }}</div></div>
-  <div class="pill"><div class="pill-label">Net alerts</div> <div class="pill-val net-c"  id="cnt-net">{{ cat.network }}</div></div>
-  <div class="spark-wrap">
-    <div class="pill-label">Alerts / 5 min — last 2 h</div>
-    <canvas id="spark" width="200" height="42"></canvas>
+<!-- ── STAT STRIP ── -->
+<div class="strip">
+  <div class="pill pill-crit"><div class="pill-lbl">Critical</div><div class="pill-val v-crit" id="c-CRITICAL">{{ counts.CRITICAL }}</div></div>
+  <div class="pill pill-high"><div class="pill-lbl">High</div>    <div class="pill-val v-high" id="c-HIGH">{{ counts.HIGH }}</div></div>
+  <div class="pill pill-med" ><div class="pill-lbl">Medium</div>  <div class="pill-val v-med"  id="c-MEDIUM">{{ counts.MEDIUM }}</div></div>
+  <div class="pill pill-low" ><div class="pill-lbl">Low</div>     <div class="pill-val v-low"  id="c-LOW">{{ counts.LOW }}</div></div>
+  <div class="pill pill-info"><div class="pill-lbl">Info</div>    <div class="pill-val v-info" id="c-INFO">{{ counts.INFO }}</div></div>
+  <div class="pill pill-host"><div class="pill-lbl">Host alerts</div><div class="pill-val v-host" id="c-host">{{ cat.host }}</div></div>
+  <div class="pill pill-net" ><div class="pill-lbl">Net alerts</div> <div class="pill-val v-net"  id="c-net">{{ cat.network }}</div></div>
+  <div class="pill pill-win" ><div class="pill-lbl">Windows</div>    <div class="pill-val v-win"  id="c-win">{{ windows }}</div></div>
+  <div class="spark-pill">
+    <div class="pill-lbl">Alerts / min — last 30 min</div>
+    <canvas id="spark" width="220" height="44"></canvas>
   </div>
 </div>
 
+<!-- ── MAIN GRID ── -->
 <div class="main">
 
+  <!-- LEFT: CONTROLS -->
   <div class="card">
-    <div class="card-hdr">System</div>
+    <div class="card-hdr">System Control</div>
     <div class="card-body">
 
+      <!-- Phase badge -->
       <div id="badge" class="badge badge-{{ phase }}">
-        <span class="dot dot-{{ phase }}"></span>
+        <span class="dot dot-{{ phase }}" id="badge-dot"></span>
         <span id="badge-txt">{{ phase_label }}</span>
       </div>
 
+      <!-- Baseline progress bar -->
       <div id="prog-wrap" class="prog-wrap {{ '' if phase == 'baseline' else 'prog-hidden' }}">
         <div class="prog-labels">
           <span>Baseline learning</span>
-          <span id="prog-pct">{{ "%.0f"|format(bpct * 100) }}%</span>
+          <span id="prog-pct">{{ "%.0f"|format(bpct*100) }}%</span>
         </div>
         <div class="prog-track">
-          <div id="prog-bar" class="prog-bar" style="width:{{ "%.1f"|format(bpct * 100) }}%"></div>
+          <div id="prog-bar" class="prog-bar" style="width:{{ "%.1f"|format(bpct*100) }}%"></div>
         </div>
       </div>
 
+      <!-- Live traffic micro-bars -->
+      <div class="traffic-bar-wrap">
+        <div class="traffic-lbl">Live network traffic (pkts/s)</div>
+        <div class="traffic-bars">
+          <div>
+            <div class="tbar"><div id="tb-syn"  class="tbar-fill" style="width:0%;background:var(--red)"></div></div>
+            <div class="tbar-label"><span>SYN</span><span id="tv-syn">0</span></div>
+          </div>
+          <div>
+            <div class="tbar"><div id="tb-udp"  class="tbar-fill" style="width:0%;background:var(--org)"></div></div>
+            <div class="tbar-label"><span>UDP</span><span id="tv-udp">0</span></div>
+          </div>
+          <div>
+            <div class="tbar"><div id="tb-icmp" class="tbar-fill" style="width:0%;background:var(--amb)"></div></div>
+            <div class="tbar-label"><span>ICMP</span><span id="tv-icmp">0</span></div>
+          </div>
+          <div>
+            <div class="tbar"><div id="tb-tot"  class="tbar-fill" style="width:0%;background:var(--blu)"></div></div>
+            <div class="tbar-label"><span>TOT</span><span id="tv-tot">0</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Monitor status -->
       <div class="mon-grid">
         <div class="mon-pill">
-          <div class="mon-label">Auth Log</div>
-          <div class="mon-val"><div class="mon-dot {{ 'mon-on' if mon.auth_log else 'mon-off' }}"></div>{{ "Active" if mon.auth_log else "N/A" }}</div>
+          <div class="mon-lbl">Auth Log</div>
+          <div class="mon-val" id="mon-auth">
+            <div class="mdot {{ 'mon-on' if mon.auth_log else 'mon-off' }}"></div>
+            {{ 'Active' if mon.auth_log else 'N/A' }}
+          </div>
         </div>
         <div class="mon-pill">
-          <div class="mon-label">Process Mon.</div>
-          <div class="mon-val"><div class="mon-dot {{ 'mon-on' if mon.psutil else 'mon-off' }}"></div>{{ "Active" if mon.psutil else "No psutil" }}</div>
+          <div class="mon-lbl">Process Mon.</div>
+          <div class="mon-val" id="mon-proc">
+            <div class="mdot {{ 'mon-on' if mon.psutil else 'mon-off' }}"></div>
+            {{ 'Active' if mon.psutil else 'No psutil' }}
+          </div>
         </div>
         <div class="mon-pill">
-          <div class="mon-label">File Integrity</div>
-          <div class="mon-val"><div class="mon-dot mon-on"></div>{{ mon.fim_count }} files</div>
+          <div class="mon-lbl">File Integrity</div>
+          <div class="mon-val">
+            <div class="mdot mon-on"></div>
+            {{ mon.fim_files }} files
+          </div>
         </div>
         <div class="mon-pill">
-          <div class="mon-label">Network Cap.</div>
-          <div class="mon-val"><div class="mon-dot mon-on"></div>Active</div>
+          <div class="mon-lbl">Network Cap.</div>
+          <div class="mon-val">
+            <div class="mdot {{ 'mon-on' if running else 'mon-off' }}"></div>
+            <span id="mon-iface">{{ mon.iface }}</span>
+          </div>
         </div>
       </div>
 
+      <!-- Meta -->
       <table class="meta">
-        <tr><td>Status</td>    <td id="uptime">{{ uptime or "—" }}</td></tr>
-        <tr><td>PID</td>       <td id="pid">{{ pid or "—" }}</td></tr>
-        <tr><td>Script</td>    <td>{{ hids_script }}</td></tr>
-        <tr><td>Log file</td>  <td>{{ alert_log }}</td></tr>
-        <tr><td>Last alert</td><td id="last-ts">{{ last_ts or "—" }}</td></tr>
+        <tr><td>Status</td>     <td id="mt-uptime">{{ uptime or '—' }}</td></tr>
+        <tr><td>Interface</td>  <td>{{ mon.iface }}</td></tr>
+        <tr><td>Window</td>     <td>{{ window_secs }}s</td></tr>
+        <tr><td>Baseline</td>   <td>{{ baseline_secs }}s</td></tr>
+        <tr><td>Log file</td>   <td>{{ alert_log }}</td></tr>
+        <tr><td>Last alert</td> <td id="mt-last">{{ last_ts or '—' }}</td></tr>
       </table>
 
+      <!-- Buttons -->
       <div class="btns">
         <form method="POST" action="/start" style="margin:0">
-          <button class="btn btn-start" {{ "disabled" if running else "" }}>▶ Start HIDS</button>
+          <button class="btn btn-start" {{ 'disabled' if running else '' }}>▶ Start</button>
         </form>
         <form method="POST" action="/stop" style="margin:0">
-          <button class="btn btn-stop" {{ "disabled" if not running else "" }}>■ Stop HIDS</button>
+          <button class="btn btn-stop" {{ 'disabled' if not running else '' }}>■ Stop</button>
         </form>
+      </div>
+      <div class="btn-clear-wrap">
         <form method="POST" action="/clear" style="margin:0">
-          <button class="btn btn-clear">⊘ Clear log</button>
+          <button class="btn btn-clear">⊘ Clear alert log</button>
         </form>
       </div>
 
@@ -408,28 +524,34 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
     </div>
   </div>
 
+  <!-- RIGHT: ALERT FEED -->
   <div class="card" style="display:flex;flex-direction:column">
-    <div class="card-hdr feed-hdr-inner">
-      <div class="feed-controls">
+    <div class="card-hdr feed-hdr">
+      <div class="feed-left">
         <div class="live-dot" id="live-dot"></div>
         <span class="feed-count" id="feed-count">{{ alerts|length }} alert{{ 's' if alerts|length != 1 else '' }}</span>
-        <button class="fbtn" id="pause-btn" onclick="togglePause()">Pause</button>
+        <button class="fbtn" id="pbtn" onclick="togglePause()">Pause</button>
       </div>
       <div class="filters">
-        <button class="ftab on" onclick="setF('all',this)">All</button>
-        <button class="ftab" onclick="setF('critical',this)">Critical</button>
-        <button class="ftab" onclick="setF('high',this)">High</button>
-        <button class="ftab" onclick="setF('medium',this)">Medium</button>
+        <button class="ftab on"  onclick="setF('ALL',this)">All</button>
+        <button class="ftab" onclick="setF('CRITICAL',this)">Critical</button>
+        <button class="ftab" onclick="setF('HIGH',this)">High</button>
+        <button class="ftab" onclick="setF('MEDIUM',this)">Medium</button>
+        <button class="ftab" onclick="setF('LOW',this)">Low</button>
+        <button class="ftab" onclick="setF('INFO',this)">Info</button>
       </div>
     </div>
-    <div class="feed-list" id="feed">
+    <div class="feed" id="feed">
       {% if alerts %}
         {% for a in alerts %}
-        <div class="acard" data-sev="{{ a.severity }}" style="border-left-color:{{ a.color }}">
-          <div class="ac-icon" style="color:{{ a.color }}">{{ {"critical":"⚠","high":"▲","medium":"◆","info":"·"}[a.severity] }}</div>
+        <div class="acard" data-lv="{{ a.level }}" style="border-left-color:{{ a.color }};background:{{ a.bg }}">
+          <div class="ac-icon">{{ a.icon }}</div>
           <div>
-            <div class="ac-kind" style="color:{{ a.color }}">{{ a.label }}</div>
-            <div class="ac-detail">{{ a.detail or a.body }}</div>
+            <div class="ac-top">
+              <span class="ac-level level-{{ a.level }}">{{ a.level }}</span>
+              <span class="ac-label" style="color:{{ a.color }}">{{ a.label }}</span>
+            </div>
+            <div class="ac-detail">{{ a.detail }}</div>
           </div>
           <div class="ac-ts">{{ a.ts[11:] }}</div>
         </div>
@@ -440,160 +562,220 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
     </div>
   </div>
 
-</div>
-</div>
+</div><!-- /main -->
+</div><!-- /wrap -->
 
 <script>
-const clockEl = document.getElementById('clock');
-function tick(){ clockEl.textContent = new Date().toLocaleString(); }
-tick(); setInterval(tick, 1000);
+// ── clock ─────────────────────────────────────────────────────────────────────
+const clockEl=document.getElementById('clock');
+function tick(){clockEl.textContent=new Date().toLocaleString();}
+tick();setInterval(tick,1000);
 
-let sparkData = {{ spark|tojson }};
+// ── spark ─────────────────────────────────────────────────────────────────────
+let sparkData={{ spark|tojson }};
 function drawSpark(d){
-  const c = document.getElementById('spark');
-  if(!c) return;
-  const W = c.offsetWidth||200, H=42, max=Math.max(...d,1);
-  c.width=W; c.height=H;
-  const ctx=c.getContext('2d'); ctx.clearRect(0,0,W,H);
+  const c=document.getElementById('spark');if(!c)return;
+  const W=c.offsetWidth||220,H=44,max=Math.max(...d,1);
+  c.width=W;c.height=H;
+  const ctx=c.getContext('2d');ctx.clearRect(0,0,W,H);
   const bw=W/d.length;
   d.forEach((v,i)=>{
+    if(!v)return;
     const h=(v/max)*(H-4),x=i*bw,t=v/max;
-    ctx.fillStyle=t>.6?`rgba(255,61,87,${.4+t*.5})`:t>.2?`rgba(245,158,11,${.3+t*.5})`:`rgba(56,178,255,${.15+t*.4})`;
-    ctx.fillRect(x+1,H-h,bw-2,h);
+    ctx.fillStyle=t>.7?`rgba(255,61,87,${.45+t*.45})`
+                 :t>.35?`rgba(245,158,11,${.3+t*.5})`
+                 :`rgba(56,178,255,${.18+t*.5})`;
+    ctx.fillRect(x+1,H-h,Math.max(bw-2,1),h);
   });
 }
 drawSpark(sparkData);
 window.addEventListener('resize',()=>drawSpark(sparkData));
 
-let activeF='all';
+// ── filter ────────────────────────────────────────────────────────────────────
+let activeF='ALL';
 function setF(f,el){
   activeF=f;
   document.querySelectorAll('.ftab').forEach(b=>b.classList.remove('on'));
-  el.classList.add('on'); applyF();
+  el.classList.add('on');applyF();
 }
 function applyF(){
   document.querySelectorAll('#feed .acard').forEach(c=>{
-    c.style.display=(activeF==='all'||c.dataset.sev===activeF)?'':'none';
+    c.style.display=(activeF==='ALL'||c.dataset.lv===activeF)?'':'none';
   });
 }
 
+// ── pause ─────────────────────────────────────────────────────────────────────
 let paused=false;
 function togglePause(){
   paused=!paused;
-  document.getElementById('pause-btn').textContent=paused?'Resume':'Pause';
+  document.getElementById('pbtn').textContent=paused?'Resume':'Pause';
   document.getElementById('live-dot').classList.toggle('paused',paused);
 }
 
-const ICONS={critical:'⚠',high:'▲',medium:'◆',info:'·'};
-const PHASE_LABELS={stopped:'Stopped',baseline:'Baseline…',detecting:'Detecting'};
+// ── traffic bars ──────────────────────────────────────────────────────────────
+function setBar(id,val,max){
+  const bar=document.getElementById('tb-'+id);
+  const lbl=document.getElementById('tv-'+id);
+  if(bar) bar.style.width=Math.min((val/Math.max(max,1))*100,100)+'%';
+  if(lbl) lbl.textContent=val>999?(val/1000).toFixed(1)+'k':Math.round(val);
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+const PHASES={stopped:'Stopped',baseline:'Baseline…',detecting:'Detecting'};
+const LVLBG={CRITICAL:'rgba(255,61,87,.08)',HIGH:'rgba(255,107,53,.08)',
+             MEDIUM:'rgba(245,158,11,.08)',LOW:'rgba(56,178,255,.08)',INFO:'rgba(74,106,133,.06)'};
+const LVLCOL={CRITICAL:'#ff3d57',HIGH:'#ff6b35',MEDIUM:'#f59e0b',LOW:'#38b2ff',INFO:'#4a6a85'};
+
 function buildCard(a){
-  return `<div class="acard" data-sev="${esc(a.severity)}" style="border-left-color:${esc(a.color)}">
-    <div class="ac-icon" style="color:${esc(a.color)}">${ICONS[a.severity]||'·'}</div>
+  const bg=LVLBG[a.level]||'rgba(100,100,100,.06)';
+  const col=LVLCOL[a.level]||'#888';
+  return `<div class="acard" data-lv="${esc(a.level)}"
+               style="border-left-color:${col};background:${bg}">
+    <div class="ac-icon">${esc(a.icon||'⚠')}</div>
     <div>
-      <div class="ac-kind" style="color:${esc(a.color)}">${esc(a.label)}</div>
-      <div class="ac-detail">${esc(a.detail||a.body)}</div>
+      <div class="ac-top">
+        <span class="ac-level level-${esc(a.level)}">${esc(a.level)}</span>
+        <span class="ac-label" style="color:${col}">${esc(a.label)}</span>
+      </div>
+      <div class="ac-detail">${esc(a.detail)}</div>
     </div>
     <div class="ac-ts">${esc(a.ts?a.ts.slice(11):'')}</div>
   </div>`;
 }
 
+// ── polling ───────────────────────────────────────────────────────────────────
 let lastTs='';
+
 async function poll(){
   try{
-    const [sr,ar,mr]=await Promise.all([fetch('/status'),fetch('/alerts?n=100'),fetch('/metrics')]);
-    const st=await sr.json(), al=await ar.json(), mt=await mr.json();
+    const [sr,ar,mr]=await Promise.all([
+      fetch('/status'),fetch('/alerts?n=120'),fetch('/metrics')]);
+    const st=await sr.json(),al=await ar.json(),mt=await mr.json();
+
+    // phase badge
     const bdg=document.getElementById('badge');
     bdg.className='badge badge-'+st.phase;
-    bdg.querySelector('.dot').className='dot dot-'+st.phase;
-    document.getElementById('badge-txt').textContent=PHASE_LABELS[st.phase]||st.phase;
-    document.getElementById('uptime').textContent=st.uptime||'—';
-    document.getElementById('pid').textContent=st.pid||'—';
-    const pw=document.getElementById('prog-wrap'),pb=document.getElementById('prog-bar'),ppt=document.getElementById('prog-pct');
+    document.getElementById('badge-dot').className='dot dot-'+st.phase;
+    document.getElementById('badge-txt').textContent=PHASES[st.phase]||st.phase;
+    const hp=document.getElementById('hdr-phase');
+    if(hp) hp.textContent=PHASES[st.phase]||st.phase;
+
+    // uptime
+    const uEl=document.getElementById('mt-uptime');
+    if(uEl) uEl.textContent=st.uptime||'—';
+
+    // progress bar
+    const pw=document.getElementById('prog-wrap');
+    const pb=document.getElementById('prog-bar');
+    const pp=document.getElementById('prog-pct');
     if(st.phase==='baseline'){
       pw.classList.remove('prog-hidden');
       const p=Math.min((st.baseline_pct||0)*100,99);
-      pb.style.width=p.toFixed(1)+'%'; ppt.textContent=p.toFixed(0)+'%';
+      if(pb) pb.style.width=p.toFixed(1)+'%';
+      if(pp) pp.textContent=p.toFixed(0)+'%';
     } else { pw.classList.add('prog-hidden'); }
+
+    // windows
+    const wEl=document.getElementById('c-win');
+    if(wEl) wEl.textContent=st.windows||0;
+
+    // counts
     const c=mt.counts||{};
-    ['critical','high','medium','info'].forEach(k=>{const el=document.getElementById('cnt-'+k);if(el)el.textContent=c[k]??0;});
+    ['CRITICAL','HIGH','MEDIUM','LOW','INFO'].forEach(k=>{
+      const el=document.getElementById('c-'+k);if(el) el.textContent=c[k]??0;
+    });
     const cat=mt.cat||{};
-    const hEl=document.getElementById('cnt-host'),nEl=document.getElementById('cnt-net');
-    if(hEl)hEl.textContent=cat.host??0;
-    if(nEl)nEl.textContent=cat.network??0;
+    const hEl=document.getElementById('c-host'),nEl=document.getElementById('c-net');
+    if(hEl) hEl.textContent=cat.host??0;
+    if(nEl) nEl.textContent=cat.network??0;
+
+    // spark
     if(mt.spark){sparkData=mt.spark;drawSpark(sparkData);}
+
+    // traffic bars
+    const ns=st.last_ns||{};
+    const synMax=Math.max(ns.syn_rate||0,500);
+    setBar('syn', ns.syn_rate||0, synMax);
+    setBar('udp', ns.udp_rate||0, Math.max(ns.udp_rate||0,2000));
+    setBar('icmp',ns.icmp_rate||0,Math.max(ns.icmp_rate||0,200));
+    setBar('tot', ns.total_rate||0,Math.max(ns.total_rate||0,3000));
+
+    // last alert
     if(al.alerts&&al.alerts.length){
-      const first=al.alerts.find(a=>a.severity!=='info');
-      document.getElementById('last-ts').textContent=first?first.ts.slice(11):'—';
+      const first=al.alerts.find(a=>a.level!=='INFO');
+      const lEl=document.getElementById('mt-last');
+      if(lEl) lEl.textContent=first?first.ts.slice(11):'—';
     }
+
+    // feed
     if(!paused&&al.alerts){
-      const feed=document.getElementById('feed'),cnt=document.getElementById('feed-count');
+      const feed=document.getElementById('feed');
+      const cntEl=document.getElementById('feed-count');
       const newestTs=al.alerts.length?al.alerts[0].ts:'';
       if(newestTs!==lastTs){
         lastTs=newestTs;
         if(!al.alerts.length){
           feed.innerHTML='<div class="empty"><div class="empty-icon">◎</div><div>No alerts yet</div></div>';
-          cnt.textContent='0 alerts';
+          if(cntEl) cntEl.textContent='0 alerts';
         } else {
           feed.innerHTML=al.alerts.map(buildCard).join('');
-          cnt.textContent=al.alerts.length+' alert'+(al.alerts.length!==1?'s':'');
+          if(cntEl) cntEl.textContent=al.alerts.length+' alert'+(al.alerts.length!==1?'s':'');
           applyF();
         }
       }
     }
   }catch(e){}
 }
-poll(); setInterval(poll,5000);
+poll();setInterval(poll,2000);
 </script>
 </body>
 </html>"""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Render helper
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# RENDER HELPER
+# =============================================================================
 
-def _render(flash: str = "", ok: bool = True) -> str:
-    running = _running()
-    phase   = _phase_from_log()
-    alerts  = _read_alerts(100)
+def _render(flash: str = "", ok: bool = True):
+    st      = engine_mod.get_state()
+    running = engine_mod.is_running()
+    phase   = st.get("phase", "stopped")
+    mon     = st.get("monitors", {})
     labels  = {"stopped": "Stopped", "baseline": "Baseline…", "detecting": "Detecting"}
-    lts     = next((a["ts"][11:] for a in alerts if a["severity"] != "info"), None)
-
-    with _lock:
-        p   = _proc
-        pid = p.pid if p else None
-
-    mon = {
-        "auth_log":  True,
-        "psutil":    True,
-        "fim_count": 6,   # matches default MONITORED_FILES length in hids_main.py
-    }
+    alerts  = _read_alerts(120)
+    lts     = next((a["ts"][11:] for a in alerts if a["level"] != "INFO"), None)
 
     return render_template_string(
         TMPL,
-        running     = running,
-        phase       = phase,
-        phase_label = labels.get(phase, phase.title()),
-        uptime      = _uptime(),
-        pid         = pid,
-        bpct        = _baseline_pct(),
-        alerts      = alerts,
-        counts      = _counts(),
-        cat         = _alert_category_counts(),
-        spark       = _spark(),
-        alert_log   = ALERT_LOG,
-        hids_script = HIDS_SCRIPT,
-        last_ts     = lts,
-        flash       = flash,
-        ok          = ok,
-        mon         = mon,
+        running      = running,
+        phase        = phase,
+        phase_label  = labels.get(phase, phase.title()),
+        uptime       = _uptime(),
+        bpct         = st.get("baseline_pct", 0.0),
+        windows      = st.get("windows", 0),
+        alerts       = alerts,
+        counts       = _counts(),
+        cat          = _category_counts(),
+        spark        = _spark(),
+        alert_log    = ALERT_LOG,
+        last_ts      = lts,
+        flash        = flash,
+        ok           = ok,
+        mon          = {
+            "auth_log":  mon.get("auth_log",  False),
+            "psutil":    mon.get("psutil",    False),
+            "fim_files": mon.get("fim_files", 0),
+            "iface":     mon.get("iface",     "—"),
+        },
+        window_secs   = engine_mod.WINDOW_SECONDS,
+        baseline_secs = engine_mod.BASELINE_SECONDS,
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Routes
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# ROUTES
+# =============================================================================
 
 @app.get("/")
 def index():
@@ -602,58 +784,18 @@ def index():
 
 @app.post("/start")
 def start():
-    global _proc, _start_time, _stop_reason
-
-    if _running():
-        return _render("HIDS is already running.", ok=False)
-    if not os.path.exists(HIDS_SCRIPT):
-        return _render("Script not found: %s" % HIDS_SCRIPT, ok=False)
-
-    try:
-        p = subprocess.Popen(
-            ["sudo", sys.executable, HIDS_SCRIPT],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-        )
-        with _lock:
-            _proc        = p
-            _start_time  = datetime.now()
-            _stop_reason = ""
-
-        threading.Thread(target=_watcher, args=(p,), daemon=True).start()
-        return _render("HIDS started — baseline phase running.", ok=True)
-
-    except Exception as exc:
-        return _render("Failed to start: %s" % exc, ok=False)
+    if engine_mod.is_running():
+        return _render("Engine is already running.", ok=False)
+    engine_mod.start_engine()
+    return _render("Engine started.", ok=True)
 
 
 @app.post("/stop")
 def stop():
-    global _proc, _stop_reason
-
-    if not _running():
-        return _render("HIDS is not running.", ok=False)
-
-    with _lock:
-        p = _proc
-
-    try:
-        p.terminate()
-        try:
-            p.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            p.wait()
-
-        with _lock:
-            _proc        = None
-            _stop_reason = "Stopped at %s" % datetime.now().strftime("%H:%M:%S")
-
-        return _render("HIDS stopped.", ok=True)
-
-    except Exception as exc:
-        return _render("Error stopping HIDS: %s" % exc, ok=False)
+    if not engine_mod.is_running():
+        return _render("Engine is not running.", ok=False)
+    engine_mod.stop_engine()
+    return _render("Engine stopped.", ok=True)
 
 
 @app.post("/clear")
@@ -661,40 +803,54 @@ def clear():
     try:
         if os.path.exists(ALERT_LOG):
             os.replace(ALERT_LOG, ALERT_LOG + ".bak")
-        return _render("Log cleared (backup saved as %s.bak)." % ALERT_LOG, ok=True)
-    except OSError as exc:
-        return _render("Could not clear log: %s" % exc, ok=False)
+        return _render("Log cleared (backup → %s.bak)." % ALERT_LOG, ok=True)
+    except OSError as e:
+        return _render(f"Could not clear log: {e}", ok=False)
 
 
 @app.get("/status")
 def status():
-    phase = _phase_from_log()
-    with _lock:
-        p  = _proc
+    st = engine_mod.get_state()
+    ns = st.get("last_ns")
+    ns_dict = {}
+    if ns:
+        ns_dict = {
+            "syn_rate":   round(ns.syn_rate,   1),
+            "udp_rate":   round(ns.udp_rate,   1),
+            "icmp_rate":  round(ns.icmp_rate,  1),
+            "total_rate": round(ns.total_rate, 1),
+        }
     return jsonify({
-        "running":      _running(),
-        "phase":        phase,
+        "running":      engine_mod.is_running(),
+        "phase":        st.get("phase", "stopped"),
         "uptime":       _uptime(),
-        "pid":          p.pid if p else None,
-        "baseline_pct": _baseline_pct(),
-        "stop_reason":  _stop_reason,
+        "windows":      st.get("windows", 0),
+        "baseline_pct": st.get("baseline_pct", 0.0),
+        "last_ns":      ns_dict,
     })
 
 
 @app.get("/alerts")
-def alerts_route():
-    n = min(int(request.args.get("n", 100)), 200)
-    return jsonify({"alerts": _read_alerts(n), "log_file": ALERT_LOG})
+def alerts_api():
+    n = min(int(request.args.get("n", 120)), 300)
+    return jsonify({"alerts": _read_alerts(n)})
 
 
 @app.get("/metrics")
 def metrics():
     return jsonify({
         "counts": _counts(),
-        "cat":    _alert_category_counts(),
+        "cat":    _category_counts(),
         "spark":  _spark(),
     })
 
 
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
 if __name__ == "__main__":
-    app.run(host=HOST, port=PORT, debug=False, use_reloader=False)
+    print(f"\n  Ulinzi HIDS — starting on http://0.0.0.0:{PORT}")
+    print("  Engine starting automatically in background...")
+    print("  Open http://localhost:5000 in your browser\n")
+    app.run(host=HOST_BIND, port=PORT, debug=False, use_reloader=False, threaded=True)
