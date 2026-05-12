@@ -74,12 +74,6 @@ sudo ./dist/ulinzi
    - Enter your topic name, enable notifications, click Save
    - OR edit `ulinzi.conf` directly:
    ```json
-   {
-     "ntfy_enabled": true,
-     "ntfy_topic": "ulinzi-brandon-kali-2024",
-     "ntfy_min_level": "MEDIUM"
-   }
-   ```
 
 5. **Test it** — click "Test Notification" in the Settings tab. Your phone should buzz within 2 seconds.
 
